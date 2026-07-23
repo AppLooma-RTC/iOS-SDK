@@ -1,0 +1,54 @@
+// Lio Live iOS SDK — video rendering.
+// © AppLooma LLC
+
+#if canImport(UIKit)
+import UIKit
+import LiveKit
+
+/// Renders a Lio video track (local preview or remote user).
+public final class LioVideoView: UIView {
+    private let videoView = VideoView()
+
+    public override init(frame: CGRect) {
+        super.init(frame: frame)
+        setup()
+    }
+
+    public required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        setup()
+    }
+
+    private func setup() {
+        videoView.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(videoView)
+        NSLayoutConstraint.activate([
+            videoView.topAnchor.constraint(equalTo: topAnchor),
+            videoView.bottomAnchor.constraint(equalTo: bottomAnchor),
+            videoView.leadingAnchor.constraint(equalTo: leadingAnchor),
+            videoView.trailingAnchor.constraint(equalTo: trailingAnchor),
+        ])
+    }
+
+    /// The track to render. Set nil to clear.
+    public var track: VideoTrack? {
+        get { videoView.track as? VideoTrack }
+        set { videoView.track = newValue }
+    }
+
+    /// Mirror the video (use for local front-camera preview).
+    public var isMirrored: Bool {
+        get { videoView.mirrorMode == .mirror }
+        set { videoView.mirrorMode = newValue ? .mirror : .off }
+    }
+
+    /// Show a remote user's video.
+    public func attach(user: LioRemoteUser) { track = user.videoTrack }
+
+    /// Show the local camera preview.
+    public func attachLocal(engine: LioEngine) {
+        track = engine.localVideoTrack
+        isMirrored = true
+    }
+}
+#endif
