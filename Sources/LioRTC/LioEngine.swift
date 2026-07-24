@@ -59,6 +59,7 @@ public protocol LioEngineDelegate: AnyObject {
     func lioEngine(_ engine: LioEngine, trackSubscribedFor user: LioRemoteUser)
     func lioEngine(_ engine: LioEngine, connectionStateChanged state: LioConnectionState)
     func lioEngine(_ engine: LioEngine, dataReceived data: Data, from user: LioRemoteUser?)
+    func lioEngine(_ engine: LioEngine, giftReceived gift: LioGiftEvent)
 }
 
 // Default empty implementations so integrators override only what they need.
@@ -68,6 +69,7 @@ public extension LioEngineDelegate {
     func lioEngine(_ engine: LioEngine, trackSubscribedFor user: LioRemoteUser) {}
     func lioEngine(_ engine: LioEngine, connectionStateChanged state: LioConnectionState) {}
     func lioEngine(_ engine: LioEngine, dataReceived data: Data, from user: LioRemoteUser?) {}
+    func lioEngine(_ engine: LioEngine, giftReceived gift: LioGiftEvent) {}
 }
 
 /// Main entry point of the Lio Live SDK.
@@ -188,6 +190,36 @@ extension LioEngine: RoomDelegate {
 
     public func room(_ room: Room, participant: RemoteParticipant?, didReceiveData data: Data, forTopic topic: String, encryptionType: EncryptionType) {
         let user = participant.map { userFor($0) }
-        Task { @MainActor in self.delegate?.lioEngine(self, dataReceived: data, from: user) }
+        let gift = LioGiftEvent.tryParse(data)
+        Task { @MainActor in
+            self.delegate?.lioEngine(self, dataReceived: data, from: user)
+            if let gift { self.delegate?.lioEngine(self, giftReceived: gift) }
+        }
+    }
+}
+
+// MARK: - Virtual gifts
+
+/// A virtual gift broadcast to the room (sent via your server's POST /v1/gifts/send).
+public struct LioGiftEvent: Decodable {
+    public struct GiftInfo: Decodable {
+        public let id: String
+        public let name: String
+        public let imageUrl: String
+        public let coinPrice: Int
+    }
+    public let txId: String
+    public let gift: GiftInfo
+    public let sender: String
+    public let receiver: String
+    public let quantity: Int
+
+    /// Parses a data-channel payload; returns nil if it isn't a lio.gift event.
+    public static func tryParse(_ data: Data) -> LioGiftEvent? {
+        guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              obj["type"] as? String == "lio.gift",
+              let decoded = try? JSONDecoder().decode(LioGiftEvent.self, from: data)
+        else { return nil }
+        return decoded
     }
 }
