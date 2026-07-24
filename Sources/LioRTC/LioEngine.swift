@@ -88,14 +88,14 @@ public final class LioEngine {
         self.room.add(delegate: self)
     }
 
-    /// Create an engine instance with your Lio Live App ID (console.liolive.com).
+    /// Create an engine instance with your Lio Live App ID (applooma.dev/dashboard).
     public static func create(appId: String, delegate: LioEngineDelegate? = nil) -> LioEngine {
         precondition(!appId.isEmpty, "LioEngine.create: appId is required")
         return LioEngine(appId: appId, delegate: delegate)
     }
 
     /// Join a channel with a token from your server
-    /// (POST https://api.liolive.com/v1/token → { token, wsUrl }).
+    /// (POST https://api.applooma.dev/v1/token → { token, wsUrl }).
     public func joinChannel(token: String, wsUrl: String, options: LioJoinOptions = LioJoinOptions()) async throws {
         guard !isJoined else { throw LioError.alreadyJoined }
         try await room.connect(url: wsUrl, token: token)
