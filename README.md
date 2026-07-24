@@ -1,11 +1,11 @@
-# LioRTC (iOS)
+# AppLoomaRTC (iOS)
 
-Lio Live iOS SDK — real-time voice, video, live streaming and audio rooms by AppLooma LLC.
+AppLooma RTC iOS SDK — real-time voice, video, live streaming and audio rooms by AppLooma LLC.
 
 ## Install (Swift Package Manager)
 
 Xcode → File → Add Package Dependencies →
-`https://github.com/applooma/lio-rtc-ios`
+`https://github.com/applooma/applooma-rtc-ios`
 
 Add to `Info.plist`:
 - `NSCameraUsageDescription`
@@ -14,14 +14,14 @@ Add to `Info.plist`:
 ## Quickstart
 
 ```swift
-import LioRTC
+import AppLoomaRTC
 
-class CallViewController: UIViewController, LioEngineDelegate {
-    var engine: LioEngine!
+class CallViewController: UIViewController, AppEngineDelegate {
+    var engine: AppEngine!
 
     override func viewDidLoad() {
         super.viewDidLoad()
-        engine = LioEngine.create(appId: "YOUR_APP_ID", delegate: self)
+        engine = AppEngine.create(appId: "YOUR_APP_ID", delegate: self)
 
         Task {
             // Get { token, wsUrl } from YOUR server, which calls
@@ -29,13 +29,13 @@ class CallViewController: UIViewController, LioEngineDelegate {
             try await engine.joinChannel(
                 token: token,
                 wsUrl: wsUrl,
-                options: LioJoinOptions(role: .host, camera: true)
+                options: AppJoinOptions(role: .host, camera: true)
             )
         }
     }
 
-    func lioEngine(_ engine: LioEngine, trackSubscribedFor user: LioRemoteUser) {
-        remoteVideoView.attach(user: user)   // LioVideoView
+    func lioEngine(_ engine: AppEngine, trackSubscribedFor user: AppRemoteUser) {
+        remoteVideoView.attach(user: user)   // AppVideoView
     }
 }
 ```

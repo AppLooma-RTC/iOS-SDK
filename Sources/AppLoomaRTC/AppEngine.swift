@@ -1,32 +1,32 @@
-// Lio Live iOS SDK — main entry point.
+// AppLooma RTC iOS SDK — main entry point.
 // © AppLooma LLC
 //
-//   let engine = LioEngine.create(appId: "YOUR_APP_ID", delegate: self)
+//   let engine = AppEngine.create(appId: "YOUR_APP_ID", delegate: self)
 //   try await engine.joinChannel(token: token, wsUrl: wsUrl,
-//                                options: LioJoinOptions(role: .host, camera: true))
+//                                options: AppJoinOptions(role: .host, camera: true))
 
 import Foundation
 import LiveKit
 
-/// Roles supported by Lio Live channels.
-public enum LioRole: String, Sendable {
+/// Roles supported by AppLooma RTC channels.
+public enum AppRole: String, Sendable {
     case host, cohost, audience
 }
 
 /// Connection lifecycle states.
-public enum LioConnectionState: Sendable {
+public enum AppConnectionState: Sendable {
     case connecting, connected, reconnecting, disconnected
 }
 
 /// Options for joining a channel.
-public struct LioJoinOptions: Sendable {
-    public var role: LioRole
+public struct AppJoinOptions: Sendable {
+    public var role: AppRole
     /// Auto-enable camera on join (ignored for audience).
     public var camera: Bool
     /// Auto-enable microphone on join (ignored for audience).
     public var microphone: Bool
 
-    public init(role: LioRole = .host, camera: Bool = false, microphone: Bool = true) {
+    public init(role: AppRole = .host, camera: Bool = false, microphone: Bool = true) {
         self.role = role
         self.camera = camera
         self.microphone = microphone
@@ -34,7 +34,7 @@ public struct LioJoinOptions: Sendable {
 }
 
 /// A remote user in the channel.
-public final class LioRemoteUser {
+public final class AppRemoteUser {
     let participant: RemoteParticipant
     init(_ p: RemoteParticipant) { participant = p }
 
@@ -43,7 +43,7 @@ public final class LioRemoteUser {
     public var metadata: String? { participant.metadata }
     public var isSpeaking: Bool { participant.isSpeaking }
 
-    /// First available video track for rendering with `LioVideoView`.
+    /// First available video track for rendering with `AppVideoView`.
     public var videoTrack: VideoTrack? {
         participant.videoTracks.compactMap { $0.track as? VideoTrack }.first
     }
@@ -53,51 +53,51 @@ public final class LioRemoteUser {
 }
 
 /// Channel event callbacks. All delivered on the main actor.
-public protocol LioEngineDelegate: AnyObject {
-    func lioEngine(_ engine: LioEngine, userJoined user: LioRemoteUser)
-    func lioEngine(_ engine: LioEngine, userLeft user: LioRemoteUser)
-    func lioEngine(_ engine: LioEngine, trackSubscribedFor user: LioRemoteUser)
-    func lioEngine(_ engine: LioEngine, connectionStateChanged state: LioConnectionState)
-    func lioEngine(_ engine: LioEngine, dataReceived data: Data, from user: LioRemoteUser?)
-    func lioEngine(_ engine: LioEngine, giftReceived gift: LioGiftEvent)
+public protocol AppEngineDelegate: AnyObject {
+    func lioEngine(_ engine: AppEngine, userJoined user: AppRemoteUser)
+    func lioEngine(_ engine: AppEngine, userLeft user: AppRemoteUser)
+    func lioEngine(_ engine: AppEngine, trackSubscribedFor user: AppRemoteUser)
+    func lioEngine(_ engine: AppEngine, connectionStateChanged state: AppConnectionState)
+    func lioEngine(_ engine: AppEngine, dataReceived data: Data, from user: AppRemoteUser?)
+    func lioEngine(_ engine: AppEngine, giftReceived gift: AppGiftEvent)
 }
 
 // Default empty implementations so integrators override only what they need.
-public extension LioEngineDelegate {
-    func lioEngine(_ engine: LioEngine, userJoined user: LioRemoteUser) {}
-    func lioEngine(_ engine: LioEngine, userLeft user: LioRemoteUser) {}
-    func lioEngine(_ engine: LioEngine, trackSubscribedFor user: LioRemoteUser) {}
-    func lioEngine(_ engine: LioEngine, connectionStateChanged state: LioConnectionState) {}
-    func lioEngine(_ engine: LioEngine, dataReceived data: Data, from user: LioRemoteUser?) {}
-    func lioEngine(_ engine: LioEngine, giftReceived gift: LioGiftEvent) {}
+public extension AppEngineDelegate {
+    func lioEngine(_ engine: AppEngine, userJoined user: AppRemoteUser) {}
+    func lioEngine(_ engine: AppEngine, userLeft user: AppRemoteUser) {}
+    func lioEngine(_ engine: AppEngine, trackSubscribedFor user: AppRemoteUser) {}
+    func lioEngine(_ engine: AppEngine, connectionStateChanged state: AppConnectionState) {}
+    func lioEngine(_ engine: AppEngine, dataReceived data: Data, from user: AppRemoteUser?) {}
+    func lioEngine(_ engine: AppEngine, giftReceived gift: AppGiftEvent) {}
 }
 
-/// Main entry point of the Lio Live SDK.
-public final class LioEngine {
+/// Main entry point of the AppLooma RTC SDK.
+public final class AppEngine {
     public let appId: String
-    public weak var delegate: LioEngineDelegate?
+    public weak var delegate: AppEngineDelegate?
 
     let room: Room
-    private var users: [String: LioRemoteUser] = [:]
+    private var users: [String: AppRemoteUser] = [:]
     public private(set) var isJoined = false
 
-    private init(appId: String, delegate: LioEngineDelegate?) {
+    private init(appId: String, delegate: AppEngineDelegate?) {
         self.appId = appId
         self.delegate = delegate
         self.room = Room()
         self.room.add(delegate: self)
     }
 
-    /// Create an engine instance with your Lio Live App ID (applooma.dev/dashboard).
-    public static func create(appId: String, delegate: LioEngineDelegate? = nil) -> LioEngine {
-        precondition(!appId.isEmpty, "LioEngine.create: appId is required")
-        return LioEngine(appId: appId, delegate: delegate)
+    /// Create an engine instance with your AppLooma RTC App ID (applooma.dev/dashboard).
+    public static func create(appId: String, delegate: AppEngineDelegate? = nil) -> AppEngine {
+        precondition(!appId.isEmpty, "AppEngine.create: appId is required")
+        return AppEngine(appId: appId, delegate: delegate)
     }
 
     /// Join a channel with a token from your server
     /// (POST https://api.applooma.dev/v1/token → { token, wsUrl }).
-    public func joinChannel(token: String, wsUrl: String, options: LioJoinOptions = LioJoinOptions()) async throws {
-        guard !isJoined else { throw LioError.alreadyJoined }
+    public func joinChannel(token: String, wsUrl: String, options: AppJoinOptions = AppJoinOptions()) async throws {
+        guard !isJoined else { throw AppError.alreadyJoined }
         try await room.connect(url: wsUrl, token: token)
         isJoined = true
         if options.role != .audience {
@@ -131,7 +131,7 @@ public final class LioEngine {
 
     public var localUid: String { room.localParticipant.identity?.stringValue ?? "" }
     public var channelName: String { room.name ?? "" }
-    public var remoteUsers: [LioRemoteUser] { Array(users.values) }
+    public var remoteUsers: [AppRemoteUser] { Array(users.values) }
 
     /// Local camera track for preview rendering.
     public var localVideoTrack: VideoTrack? {
@@ -141,26 +141,26 @@ public final class LioEngine {
     /// internal — escape hatch for UIKits
     public var raw: Room { room }
 
-    func userFor(_ p: RemoteParticipant) -> LioRemoteUser {
+    func userFor(_ p: RemoteParticipant) -> AppRemoteUser {
         let key = p.identity?.stringValue ?? ""
         if let existing = users[key] { return existing }
-        let u = LioRemoteUser(p)
+        let u = AppRemoteUser(p)
         users[key] = u
         return u
     }
 
-    func removeUser(_ p: RemoteParticipant) -> LioRemoteUser? {
+    func removeUser(_ p: RemoteParticipant) -> AppRemoteUser? {
         users.removeValue(forKey: p.identity?.stringValue ?? "")
     }
 }
 
-public enum LioError: Error {
+public enum AppError: Error {
     case alreadyJoined
 }
 
 // MARK: - RoomDelegate bridge
 
-extension LioEngine: RoomDelegate {
+extension AppEngine: RoomDelegate {
     public func room(_ room: Room, participantDidConnect participant: RemoteParticipant) {
         let user = userFor(participant)
         Task { @MainActor in self.delegate?.lioEngine(self, userJoined: user) }
@@ -177,7 +177,7 @@ extension LioEngine: RoomDelegate {
     }
 
     public func room(_ room: Room, didUpdateConnectionState state: ConnectionState, from oldState: ConnectionState) {
-        let mapped: LioConnectionState
+        let mapped: AppConnectionState
         switch state {
         case .connecting: mapped = .connecting
         case .connected: mapped = .connected
@@ -190,7 +190,7 @@ extension LioEngine: RoomDelegate {
 
     public func room(_ room: Room, participant: RemoteParticipant?, didReceiveData data: Data, forTopic topic: String, encryptionType: EncryptionType) {
         let user = participant.map { userFor($0) }
-        let gift = LioGiftEvent.tryParse(data)
+        let gift = AppGiftEvent.tryParse(data)
         Task { @MainActor in
             self.delegate?.lioEngine(self, dataReceived: data, from: user)
             if let gift { self.delegate?.lioEngine(self, giftReceived: gift) }
@@ -201,7 +201,7 @@ extension LioEngine: RoomDelegate {
 // MARK: - Virtual gifts
 
 /// A virtual gift broadcast to the room (sent via your server's POST /v1/gifts/send).
-public struct LioGiftEvent: Decodable {
+public struct AppGiftEvent: Decodable {
     public struct GiftInfo: Decodable {
         public let id: String
         public let name: String
@@ -215,10 +215,10 @@ public struct LioGiftEvent: Decodable {
     public let quantity: Int
 
     /// Parses a data-channel payload; returns nil if it isn't a lio.gift event.
-    public static func tryParse(_ data: Data) -> LioGiftEvent? {
+    public static func tryParse(_ data: Data) -> AppGiftEvent? {
         guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               obj["type"] as? String == "lio.gift",
-              let decoded = try? JSONDecoder().decode(LioGiftEvent.self, from: data)
+              let decoded = try? JSONDecoder().decode(AppGiftEvent.self, from: data)
         else { return nil }
         return decoded
     }

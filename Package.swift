@@ -1,12 +1,12 @@
 // swift-tools-version:5.9
-// Lio Live iOS SDK — © AppLooma LLC
+// AppLooma RTC iOS SDK — © AppLooma LLC
 import PackageDescription
 
 let package = Package(
-    name: "LioRTC",
+    name: "AppLoomaRTC",
     platforms: [.iOS(.v14), .macOS(.v11)],
     products: [
-        .library(name: "LioRTC", targets: ["LioRTC"])
+        .library(name: "AppLoomaRTC", targets: ["AppLoomaRTC"])
     ],
     dependencies: [
         // Media engine (internal implementation detail)
@@ -14,9 +14,9 @@ let package = Package(
     ],
     targets: [
         .target(
-            name: "LioRTC",
+            name: "AppLoomaRTC",
             dependencies: [.product(name: "LiveKit", package: "client-sdk-swift")],
-            path: "Sources/LioRTC"
+            path: "Sources/AppLoomaRTC"
         )
     ]
 )

@@ -1,4 +1,4 @@
-// Lio Live iOS SDK — video rendering.
+// AppLooma RTC iOS SDK — video rendering.
 // © AppLooma LLC
 
 #if canImport(UIKit)
@@ -6,7 +6,7 @@ import UIKit
 import LiveKit
 
 /// Renders a Lio video track (local preview or remote user).
-public final class LioVideoView: UIView {
+public final class AppVideoView: UIView {
     private let videoView = VideoView()
 
     public override init(frame: CGRect) {
@@ -43,10 +43,10 @@ public final class LioVideoView: UIView {
     }
 
     /// Show a remote user's video.
-    public func attach(user: LioRemoteUser) { track = user.videoTrack }
+    public func attach(user: AppRemoteUser) { track = user.videoTrack }
 
     /// Show the local camera preview.
-    public func attachLocal(engine: LioEngine) {
+    public func attachLocal(engine: AppEngine) {
         track = engine.localVideoTrack
         isMirrored = true
     }
