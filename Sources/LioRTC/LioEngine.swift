@@ -186,7 +186,7 @@ extension LioEngine: RoomDelegate {
         Task { @MainActor in self.delegate?.lioEngine(self, connectionStateChanged: mapped) }
     }
 
-    public func room(_ room: Room, participant: RemoteParticipant?, didReceiveData data: Data, forTopic topic: String) {
+    public func room(_ room: Room, participant: RemoteParticipant?, didReceiveData data: Data, forTopic topic: String, encryptionType: EncryptionType) {
         let user = participant.map { userFor($0) }
         Task { @MainActor in self.delegate?.lioEngine(self, dataReceived: data, from: user) }
     }
