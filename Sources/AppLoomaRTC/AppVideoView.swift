@@ -3,7 +3,7 @@
 
 #if canImport(UIKit)
 import UIKit
-import LiveKit
+import AppLoomaCore
 
 /// Renders a AppLooma video track (local preview or remote user).
 public final class AppVideoView: UIView {

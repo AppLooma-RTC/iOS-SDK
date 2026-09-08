@@ -9,13 +9,12 @@ let package = Package(
         .library(name: "AppLoomaRTC", targets: ["AppLoomaRTC"])
     ],
     dependencies: [
-        // Media transport layer
-        .package(url: "https://github.com/livekit/client-sdk-swift.git", from: "2.0.0")
+        .package(url: "https://github.com/apploomadev/iOS-Core.git", from: "2.12.0")
     ],
     targets: [
         .target(
             name: "AppLoomaRTC",
-            dependencies: [.product(name: "LiveKit", package: "client-sdk-swift")],
+            dependencies: [.product(name: "AppLoomaCore", package: "iOS-Core")],
             path: "Sources/AppLoomaRTC"
         )
     ]

@@ -6,7 +6,7 @@
 //                                options: AppJoinOptions(role: .host, camera: true))
 
 import Foundation
-import LiveKit
+import AppLoomaCore
 
 /// Roles supported by AppLooma RTC channels.
 public enum AppRole: String, Sendable {
