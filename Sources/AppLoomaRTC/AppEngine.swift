@@ -100,6 +100,12 @@ public final class AppEngine {
         guard !isJoined else { throw AppError.alreadyJoined }
         try await room.connect(url: wsUrl, token: token)
         isJoined = true
+
+        // Participants already in the room when we join never produce a
+        // participantDidConnect callback; without this an audience member
+        // joining a live stream sees nobody and never receives the host's video.
+        seedExistingParticipants()
+
         if options.role != .audience {
             if options.microphone { try await room.localParticipant.setMicrophone(enabled: true) }
             if options.camera { try await room.localParticipant.setCamera(enabled: true) }
@@ -110,6 +116,18 @@ public final class AppEngine {
         await room.disconnect()
         isJoined = false
         users.removeAll()
+    }
+
+    /// Announces everyone already present, and their already-published tracks.
+    private func seedExistingParticipants() {
+        for participant in room.remoteParticipants.values {
+            let user = userFor(participant)
+            let hasTrack = participant.trackPublications.values.contains { $0.track != nil }
+            Task { @MainActor in
+                self.delegate?.appEngine(self, userJoined: user)
+                if hasTrack { self.delegate?.appEngine(self, trackSubscribedFor: user) }
+            }
+        }
     }
 
     // MARK: - Local media controls
@@ -184,7 +202,16 @@ extension AppEngine: RoomDelegate {
         case .reconnecting: mapped = .reconnecting
         default: mapped = .disconnected
         }
-        if case .disconnected = state { isJoined = false }
+        if case .disconnected = state {
+            isJoined = false
+            // Report everyone as gone; a stale roster after a disconnect made
+            // remoteUsers wrong until the next join.
+            let gone = Array(users.values)
+            users.removeAll()
+            Task { @MainActor in
+                for user in gone { self.delegate?.appEngine(self, userLeft: user) }
+            }
+        }
         Task { @MainActor in self.delegate?.appEngine(self, connectionStateChanged: mapped) }
     }
 
