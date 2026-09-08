@@ -34,7 +34,7 @@ class CallViewController: UIViewController, AppEngineDelegate {
         }
     }
 
-    func lioEngine(_ engine: AppEngine, trackSubscribedFor user: AppRemoteUser) {
+    func appEngine(_ engine: AppEngine, trackSubscribedFor user: AppRemoteUser) {
         remoteVideoView.attach(user: user)   // AppVideoView
     }
 }

@@ -5,7 +5,7 @@
 import UIKit
 import LiveKit
 
-/// Renders a Lio video track (local preview or remote user).
+/// Renders a AppLooma video track (local preview or remote user).
 public final class AppVideoView: UIView {
     private let videoView = VideoView()
 

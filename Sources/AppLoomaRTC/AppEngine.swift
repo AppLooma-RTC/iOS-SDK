@@ -54,22 +54,22 @@ public final class AppRemoteUser {
 
 /// Channel event callbacks. All delivered on the main actor.
 public protocol AppEngineDelegate: AnyObject {
-    func lioEngine(_ engine: AppEngine, userJoined user: AppRemoteUser)
-    func lioEngine(_ engine: AppEngine, userLeft user: AppRemoteUser)
-    func lioEngine(_ engine: AppEngine, trackSubscribedFor user: AppRemoteUser)
-    func lioEngine(_ engine: AppEngine, connectionStateChanged state: AppConnectionState)
-    func lioEngine(_ engine: AppEngine, dataReceived data: Data, from user: AppRemoteUser?)
-    func lioEngine(_ engine: AppEngine, giftReceived gift: AppGiftEvent)
+    func appEngine(_ engine: AppEngine, userJoined user: AppRemoteUser)
+    func appEngine(_ engine: AppEngine, userLeft user: AppRemoteUser)
+    func appEngine(_ engine: AppEngine, trackSubscribedFor user: AppRemoteUser)
+    func appEngine(_ engine: AppEngine, connectionStateChanged state: AppConnectionState)
+    func appEngine(_ engine: AppEngine, dataReceived data: Data, from user: AppRemoteUser?)
+    func appEngine(_ engine: AppEngine, giftReceived gift: AppGiftEvent)
 }
 
 // Default empty implementations so integrators override only what they need.
 public extension AppEngineDelegate {
-    func lioEngine(_ engine: AppEngine, userJoined user: AppRemoteUser) {}
-    func lioEngine(_ engine: AppEngine, userLeft user: AppRemoteUser) {}
-    func lioEngine(_ engine: AppEngine, trackSubscribedFor user: AppRemoteUser) {}
-    func lioEngine(_ engine: AppEngine, connectionStateChanged state: AppConnectionState) {}
-    func lioEngine(_ engine: AppEngine, dataReceived data: Data, from user: AppRemoteUser?) {}
-    func lioEngine(_ engine: AppEngine, giftReceived gift: AppGiftEvent) {}
+    func appEngine(_ engine: AppEngine, userJoined user: AppRemoteUser) {}
+    func appEngine(_ engine: AppEngine, userLeft user: AppRemoteUser) {}
+    func appEngine(_ engine: AppEngine, trackSubscribedFor user: AppRemoteUser) {}
+    func appEngine(_ engine: AppEngine, connectionStateChanged state: AppConnectionState) {}
+    func appEngine(_ engine: AppEngine, dataReceived data: Data, from user: AppRemoteUser?) {}
+    func appEngine(_ engine: AppEngine, giftReceived gift: AppGiftEvent) {}
 }
 
 /// Main entry point of the AppLooma RTC SDK.
@@ -163,17 +163,17 @@ public enum AppError: Error {
 extension AppEngine: RoomDelegate {
     public func room(_ room: Room, participantDidConnect participant: RemoteParticipant) {
         let user = userFor(participant)
-        Task { @MainActor in self.delegate?.lioEngine(self, userJoined: user) }
+        Task { @MainActor in self.delegate?.appEngine(self, userJoined: user) }
     }
 
     public func room(_ room: Room, participantDidDisconnect participant: RemoteParticipant) {
         guard let user = removeUser(participant) else { return }
-        Task { @MainActor in self.delegate?.lioEngine(self, userLeft: user) }
+        Task { @MainActor in self.delegate?.appEngine(self, userLeft: user) }
     }
 
     public func room(_ room: Room, participant: RemoteParticipant, didSubscribeTrack publication: RemoteTrackPublication) {
         let user = userFor(participant)
-        Task { @MainActor in self.delegate?.lioEngine(self, trackSubscribedFor: user) }
+        Task { @MainActor in self.delegate?.appEngine(self, trackSubscribedFor: user) }
     }
 
     public func room(_ room: Room, didUpdateConnectionState state: ConnectionState, from oldState: ConnectionState) {
@@ -185,15 +185,15 @@ extension AppEngine: RoomDelegate {
         default: mapped = .disconnected
         }
         if case .disconnected = state { isJoined = false }
-        Task { @MainActor in self.delegate?.lioEngine(self, connectionStateChanged: mapped) }
+        Task { @MainActor in self.delegate?.appEngine(self, connectionStateChanged: mapped) }
     }
 
     public func room(_ room: Room, participant: RemoteParticipant?, didReceiveData data: Data, forTopic topic: String, encryptionType: EncryptionType) {
         let user = participant.map { userFor($0) }
         let gift = AppGiftEvent.tryParse(data)
         Task { @MainActor in
-            self.delegate?.lioEngine(self, dataReceived: data, from: user)
-            if let gift { self.delegate?.lioEngine(self, giftReceived: gift) }
+            self.delegate?.appEngine(self, dataReceived: data, from: user)
+            if let gift { self.delegate?.appEngine(self, giftReceived: gift) }
         }
     }
 }
@@ -214,10 +214,10 @@ public struct AppGiftEvent: Decodable {
     public let receiver: String
     public let quantity: Int
 
-    /// Parses a data-channel payload; returns nil if it isn't a lio.gift event.
+    /// Parses a data-channel payload; returns nil if it isn't a applooma.gift event.
     public static func tryParse(_ data: Data) -> AppGiftEvent? {
         guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              obj["type"] as? String == "lio.gift",
+              obj["type"] as? String == "applooma.gift",
               let decoded = try? JSONDecoder().decode(AppGiftEvent.self, from: data)
         else { return nil }
         return decoded
