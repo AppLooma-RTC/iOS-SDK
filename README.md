@@ -5,7 +5,10 @@ AppLooma RTC iOS SDK — real-time voice, video, live streaming and audio rooms 
 ## Install (Swift Package Manager)
 
 Xcode → File → Add Package Dependencies →
-`<your AppLooma-provided package URL — see the console>`
+`https://github.com/apploomadev/iOS-SDK`
+
+This monorepo directory is the source of truth; the public Swift package is
+mirrored to that repository and tagged per release.
 
 Add to `Info.plist`:
 - `NSCameraUsageDescription`
@@ -53,4 +56,4 @@ await engine.leaveChannel()
 
 `host` (admin + publish) · `cohost` (publish) · `audience` (view only)
 
-Docs: https://applooma.dev/dashboard/docs
+Docs: https://docs.applooma.dev/sdk/ios
