@@ -52,6 +52,11 @@ try await engine.sendData(Data("hello".utf8))
 await engine.leaveChannel()
 ```
 
+## What it depends on
+
+`AppLoomaCore`, the media transport layer, resolved automatically by Swift
+Package Manager. Nothing else.
+
 ## Roles
 
 `host` (admin + publish) · `cohost` (publish) · `audience` (view only)
