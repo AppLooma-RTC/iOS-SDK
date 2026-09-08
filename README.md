@@ -5,7 +5,7 @@ AppLooma RTC iOS SDK — real-time voice, video, live streaming and audio rooms 
 ## Install (Swift Package Manager)
 
 Xcode → File → Add Package Dependencies →
-`https://github.com/applooma/applooma-rtc-ios`
+`<your AppLooma-provided package URL — see the console>`
 
 Add to `Info.plist`:
 - `NSCameraUsageDescription`
