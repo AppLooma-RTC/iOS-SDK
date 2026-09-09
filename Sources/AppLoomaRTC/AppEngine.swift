@@ -33,6 +33,24 @@ public struct AppJoinOptions: Sendable {
     }
 }
 
+/// A message sent to everyone in the channel.
+///
+/// Messages ride the same channel as the media, so they arrive with the same
+/// latency and need no second connection. Nothing is stored: a message reaches
+/// whoever is in the channel at the time.
+public struct AppMessage {
+    /// Unique to this message. Useful as a list id and for de-duplicating.
+    public let id: String
+    /// What was sent, when `sendMessage` was given text.
+    public let text: String?
+    /// What was sent, when it was given a dictionary.
+    public let data: [String: Any]?
+    /// Who sent it. Nil if it came from your own server.
+    public let from: AppRemoteUser?
+    /// The sender's clock, not ours — do not order messages by it alone.
+    public let sentAt: Date
+}
+
 /// A remote user in the channel.
 public final class AppRemoteUser {
     let participant: RemoteParticipant
@@ -40,8 +58,49 @@ public final class AppRemoteUser {
 
     public var uid: String { participant.identity?.stringValue ?? "" }
     public var displayName: String? { participant.name }
-    public var metadata: String? { participant.metadata }
     public var isSpeaking: Bool { participant.isSpeaking }
+
+    /// What this user is allowed to do, decided by the token their server minted.
+    /// An `.audience` member can watch and send messages but cannot publish.
+    public var role: AppRole {
+        switch parsed()["role"] as? String {
+        case "host": return .host
+        case "cohost": return .cohost
+        default: return .audience
+        }
+    }
+
+    /// Whether this user can publish. Convenient for laying out a stage.
+    public var isPublisher: Bool { role != .audience }
+
+    /// The metadata your own server put in the token, with our fields stripped out.
+    public var attributes: [String: Any] {
+        var map = parsed()
+        map.removeValue(forKey: "appId")
+        map.removeValue(forKey: "role")
+        return map
+    }
+
+    /// The raw metadata string. Prefer `attributes`.
+    public var metadata: String? { participant.metadata }
+
+    private var cachedRaw: String?
+    private var cachedValue: [String: Any]?
+
+    /// Parsing runs once per metadata string, not once per read.
+    private func parsed() -> [String: Any] {
+        let raw = participant.metadata
+        if let cached = cachedValue, cachedRaw == raw { return cached }
+        var value: [String: Any] = [:]
+        if let raw, !raw.isEmpty,
+           let data = raw.data(using: .utf8),
+           let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            value = object
+        }
+        cachedRaw = raw
+        cachedValue = value
+        return value
+    }
 
     /// First available video track for rendering with `AppVideoView`.
     public var videoTrack: VideoTrack? {
@@ -58,6 +117,11 @@ public protocol AppEngineDelegate: AnyObject {
     func appEngine(_ engine: AppEngine, userLeft user: AppRemoteUser)
     func appEngine(_ engine: AppEngine, trackSubscribedFor user: AppRemoteUser)
     func appEngine(_ engine: AppEngine, connectionStateChanged state: AppConnectionState)
+    /// Someone sent a message with `sendMessage`.
+    func appEngine(_ engine: AppEngine, messageReceived message: AppMessage)
+    /// The audience changed — someone started or stopped watching.
+    func appEngine(_ engine: AppEngine, audienceChanged audience: [AppRemoteUser])
+    /// Raw bytes from `sendData`. Platform frames are not reported here.
     func appEngine(_ engine: AppEngine, dataReceived data: Data, from user: AppRemoteUser?)
     func appEngine(_ engine: AppEngine, giftReceived gift: AppGiftEvent)
 }
@@ -68,6 +132,8 @@ public extension AppEngineDelegate {
     func appEngine(_ engine: AppEngine, userLeft user: AppRemoteUser) {}
     func appEngine(_ engine: AppEngine, trackSubscribedFor user: AppRemoteUser) {}
     func appEngine(_ engine: AppEngine, connectionStateChanged state: AppConnectionState) {}
+    func appEngine(_ engine: AppEngine, messageReceived message: AppMessage) {}
+    func appEngine(_ engine: AppEngine, audienceChanged audience: [AppRemoteUser]) {}
     func appEngine(_ engine: AppEngine, dataReceived data: Data, from user: AppRemoteUser?) {}
     func appEngine(_ engine: AppEngine, giftReceived gift: AppGiftEvent) {}
 }
@@ -141,15 +207,71 @@ public final class AppEngine {
     }
 
     /// Broadcast data to the channel (chat, signals, gifts).
+    /// Send a message to everyone in the channel.
+    ///
+    /// An audience member can call this even though they cannot publish video —
+    /// which is what makes live comments on a broadcast work.
+    ///
+    /// Nothing is stored, so a message reaches whoever is present when it is sent.
+    @discardableResult
+    public func sendMessage(
+        text: String? = nil,
+        data: [String: Any]? = nil,
+        reliable: Bool = true
+    ) async throws -> AppMessage {
+        precondition(text != nil || data != nil, "sendMessage needs text or data")
+        let message = AppMessage(
+            id: Self.newMessageId(),
+            text: text,
+            data: data,
+            from: nil,
+            sentAt: Date()
+        )
+        var frame: [String: Any] = [
+            "type": Self.messageType,
+            "id": message.id,
+            "sentAt": ISO8601DateFormatter().string(from: message.sentAt),
+        ]
+        if let text { frame["text"] = text }
+        if let data { frame["data"] = data }
+        try await sendData(JSONSerialization.data(withJSONObject: frame), reliable: reliable)
+        return message
+    }
+
+    /// Broadcast raw bytes. Prefer `sendMessage` unless you need your own format.
     public func sendData(_ data: Data, reliable: Bool = true) async throws {
         try await room.localParticipant.publish(data: data, options: DataPublishOptions(reliable: reliable))
     }
 
     // MARK: - State
 
+    /// Our own frames travel on the same channel as customer data, tagged so
+    /// the two never mix.
+    static let messageType = "applooma.message"
+    static let giftType = "applooma.gift"
+
+    private static let messageCounter = NSLock()
+    private static var messageSeq: UInt64 = 0
+
+    static func newMessageId() -> String {
+        messageCounter.lock()
+        defer { messageCounter.unlock() }
+        messageSeq &+= 1
+        return "m_\(UInt64(Date().timeIntervalSince1970 * 1000))_\(messageSeq)"
+    }
+
     public var localUid: String { room.localParticipant.identity?.stringValue ?? "" }
     public var channelName: String { room.name ?? "" }
     public var remoteUsers: [AppRemoteUser] { Array(users.values) }
+
+    /// Everyone watching without publishing. The live audience of a broadcast.
+    public var audience: [AppRemoteUser] { users.values.filter { !$0.isPublisher } }
+
+    /// How many people are watching.
+    public var audienceCount: Int { users.values.reduce(0) { $0 + ($1.isPublisher ? 0 : 1) } }
+
+    /// Everyone on stage: the host and any co-hosts, excluding you.
+    public var hosts: [AppRemoteUser] { users.values.filter { $0.isPublisher } }
 
     /// Local camera track for preview rendering.
     public var localVideoTrack: VideoTrack? {
@@ -179,14 +301,26 @@ public enum AppError: Error {
 // MARK: - RoomDelegate bridge
 
 extension AppEngine: RoomDelegate {
+    public func room(_ room: Room, participant: RemoteParticipant, didUpdateMetadata metadata: String?) {
+        // A promotion or demotion rewrites the token metadata, which is how
+        // someone moves between the stage and the audience mid-session.
+        Task { @MainActor in self.delegate?.appEngine(self, audienceChanged: self.audience) }
+    }
+
     public func room(_ room: Room, participantDidConnect participant: RemoteParticipant) {
         let user = userFor(participant)
-        Task { @MainActor in self.delegate?.appEngine(self, userJoined: user) }
+        Task { @MainActor in
+            self.delegate?.appEngine(self, userJoined: user)
+            self.delegate?.appEngine(self, audienceChanged: self.audience)
+        }
     }
 
     public func room(_ room: Room, participantDidDisconnect participant: RemoteParticipant) {
         guard let user = removeUser(participant) else { return }
-        Task { @MainActor in self.delegate?.appEngine(self, userLeft: user) }
+        Task { @MainActor in
+            self.delegate?.appEngine(self, userLeft: user)
+            self.delegate?.appEngine(self, audienceChanged: self.audience)
+        }
     }
 
     public func room(_ room: Room, participant: RemoteParticipant, didSubscribeTrack publication: RemoteTrackPublication) {
@@ -217,11 +351,30 @@ extension AppEngine: RoomDelegate {
 
     public func room(_ room: Room, participant: RemoteParticipant?, didReceiveData data: Data, forTopic topic: String, encryptionType: EncryptionType) {
         let user = participant.map { userFor($0) }
-        let gift = AppGiftEvent.tryParse(data)
-        Task { @MainActor in
-            self.delegate?.appEngine(self, dataReceived: data, from: user)
-            if let gift { self.delegate?.appEngine(self, giftReceived: gift) }
+
+        // Each frame is either ours or the customer's, never both. Reporting our
+        // own envelopes as raw data as well would deliver every comment twice to
+        // anyone implementing both callbacks.
+        let frame = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
+        let type = (frame ?? [:])["type"] as? String
+
+        if type == Self.messageType, let frame {
+            let message = AppMessage(
+                id: frame["id"] as? String ?? Self.newMessageId(),
+                text: frame["text"] as? String,
+                data: frame["data"] as? [String: Any],
+                from: user,
+                sentAt: (frame["sentAt"] as? String)
+                    .flatMap { ISO8601DateFormatter().date(from: $0) } ?? Date()
+            )
+            Task { @MainActor in self.delegate?.appEngine(self, messageReceived: message) }
+            return
         }
+        if type == Self.giftType, let gift = AppGiftEvent.tryParse(data) {
+            Task { @MainActor in self.delegate?.appEngine(self, giftReceived: gift) }
+            return
+        }
+        Task { @MainActor in self.delegate?.appEngine(self, dataReceived: data, from: user) }
     }
 }
 
