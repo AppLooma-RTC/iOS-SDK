@@ -150,7 +150,27 @@ public final class AppEngine {
     private init(appId: String, delegate: AppEngineDelegate?) {
         self.appId = appId
         self.delegate = delegate
-        self.room = Room()
+        // 1080p with simulcast so each viewer gets the layer their screen and
+        // link can take; 96 kbps voice with redundancy and no DTX.
+        self.room = Room(roomOptions: RoomOptions(
+            defaultCameraCaptureOptions: CameraCaptureOptions(dimensions: .h1080_169),
+            defaultAudioCaptureOptions: AudioCaptureOptions(
+                echoCancellation: true,
+                autoGainControl: true,
+                noiseSuppression: true
+            ),
+            defaultVideoPublishOptions: VideoPublishOptions(
+                encoding: VideoEncoding(maxBitrate: 3_500_000, maxFps: 30),
+                simulcast: true
+            ),
+            defaultAudioPublishOptions: AudioPublishOptions(
+                encoding: AudioEncoding(maxBitrate: 96_000),
+                dtx: false,
+                red: true
+            ),
+            adaptiveStream: true,
+            dynacast: true
+        ))
         self.room.add(delegate: self)
     }
 
