@@ -5,7 +5,7 @@ AppLooma RTC iOS SDK — real-time voice, video, live streaming and audio rooms 
 ## Install (Swift Package Manager)
 
 Xcode → File → Add Package Dependencies →
-`https://github.com/apploomadev/iOS-SDK`
+`https://github.com/AppLooma-RTC/iOS-SDK`
 
 This monorepo directory is the source of truth; the public Swift package is
 mirrored to that repository and tagged per release.
