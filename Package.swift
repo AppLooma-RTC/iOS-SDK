@@ -9,7 +9,7 @@ let package = Package(
         .library(name: "AppLoomaRTC", targets: ["AppLoomaRTC"])
     ],
     dependencies: [
-        .package(url: "https://github.com/apploomadev/iOS-Core.git", from: "2.12.0")
+        .package(url: "https://github.com/AppLooma-RTC/iOS-Core.git", from: "2.12.0")
     ],
     targets: [
         .target(
