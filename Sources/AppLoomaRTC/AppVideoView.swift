@@ -6,8 +6,13 @@ import UIKit
 import AppLoomaCore
 
 /// Renders a AppLooma video track (local preview or remote user).
+///
+/// A view attached with `attachLocal` follows your camera through every
+/// restart — off/on, a camera switch, a settings change — so a self-preview
+/// never stays stuck on the last frame of a track that is gone.
 public final class AppVideoView: UIView {
     private let videoView = VideoView()
+    private weak var localEngine: AppEngine?
 
     public override init(frame: CGRect) {
         super.init(frame: frame)
@@ -30,10 +35,15 @@ public final class AppVideoView: UIView {
         ])
     }
 
-    /// The track to render. Set nil to clear.
+    /// The track to render. Set nil to clear. Setting this directly detaches
+    /// the view from any engine it was following as a self-preview.
     public var track: VideoTrack? {
         get { videoView.track as? VideoTrack }
-        set { videoView.track = newValue }
+        set {
+            localEngine?.localViews.remove(self)
+            localEngine = nil
+            videoView.track = newValue
+        }
     }
 
     /// Mirror the video (use for local front-camera preview).
@@ -45,10 +55,24 @@ public final class AppVideoView: UIView {
     /// Show a remote user's video.
     public func attach(user: AppRemoteUser) { track = user.videoTrack }
 
-    /// Show the local camera preview.
+    /// Show the local camera preview. The view re-binds by itself whenever the
+    /// engine's camera track is replaced; call `refreshLocal` only if you
+    /// bypass the engine's own controls.
     public func attachLocal(engine: AppEngine) {
-        track = engine.localVideoTrack
+        localEngine?.localViews.remove(self)
+        localEngine = engine
+        engine.localViews.add(self)
+        videoView.track = engine.localVideoTrack
         isMirrored = true
     }
+
+    /// Re-read the engine's current camera track. Called by the engine on every
+    /// local track change; harmless to call yourself.
+    public func refreshLocal(engine: AppEngine) {
+        let current = engine.localVideoTrack
+        if videoView.track !== current { videoView.track = current }
+    }
+
+    deinit { localEngine?.localViews.remove(self) }
 }
 #endif
