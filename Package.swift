@@ -6,7 +6,8 @@ let package = Package(
     name: "AppLoomaRTC",
     platforms: [.iOS(.v14), .macOS(.v11)],
     products: [
-        .library(name: "AppLoomaRTC", targets: ["AppLoomaRTC"])
+        .library(name: "AppLoomaRTC", targets: ["AppLoomaRTC"]),
+        .library(name: "AppLoomaUIKit", targets: ["AppLoomaUIKit"])
     ],
     dependencies: [
         .package(url: "https://github.com/AppLooma-RTC/iOS-Core.git", from: "2.12.0")
@@ -16,6 +17,11 @@ let package = Package(
             name: "AppLoomaRTC",
             dependencies: [.product(name: "AppLoomaCore", package: "iOS-Core")],
             path: "Sources/AppLoomaRTC"
+        ),
+        .target(
+            name: "AppLoomaUIKit",
+            dependencies: ["AppLoomaRTC"],
+            path: "Sources/AppLoomaUIKit"
         )
     ]
 )

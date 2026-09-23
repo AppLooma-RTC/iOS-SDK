@@ -153,6 +153,10 @@ public final class AppRemoteUser {
     public var uid: String { participant.identity?.stringValue ?? "" }
     public var displayName: String? { participant.name }
     public var isSpeaking: Bool { participant.isSpeaking }
+    /// The user is publishing an unmuted microphone.
+    public var audioEnabled: Bool { participant.isMicrophoneEnabled() }
+    /// The user is publishing an unmuted camera.
+    public var videoEnabled: Bool { participant.isCameraEnabled() }
 
     /// What this user is allowed to do, decided by the token their server minted.
     /// An `.audience` member can watch and send messages but cannot publish.
@@ -231,6 +235,10 @@ public protocol AppEngineDelegate: AnyObject {
     func appEngine(_ engine: AppEngine, connectionStage stage: AppConnectionStage, uid: String?, elapsedMs: Int)
     /// Per-remote-user media health, every two seconds while joined.
     func appEngine(_ engine: AppEngine, remoteStats stats: [AppRemoteStats])
+    /// Who is talking right now (uids; may include your own `localUid`).
+    func appEngine(_ engine: AppEngine, activeSpeakersChanged uids: [String])
+    /// Someone muted or unmuted their camera or microphone.
+    func appEngine(_ engine: AppEngine, userMediaChangedFor user: AppRemoteUser)
 }
 
 // Default empty implementations so integrators override only what they need.
@@ -247,6 +255,8 @@ public extension AppEngineDelegate {
     func appEngine(_ engine: AppEngine, firstRemoteVideoFrameFor uid: String, elapsedMs: Int) {}
     func appEngine(_ engine: AppEngine, connectionStage stage: AppConnectionStage, uid: String?, elapsedMs: Int) {}
     func appEngine(_ engine: AppEngine, remoteStats stats: [AppRemoteStats]) {}
+    func appEngine(_ engine: AppEngine, activeSpeakersChanged uids: [String]) {}
+    func appEngine(_ engine: AppEngine, userMediaChangedFor user: AppRemoteUser) {}
 }
 
 /// Main entry point of the AppLooma RTC SDK.
@@ -633,6 +643,15 @@ extension AppEngine: RoomDelegate {
 
     public func room(_ room: Room, participant: Participant, trackPublication: TrackPublication, didUpdateIsMuted isMuted: Bool) {
         if participant is LocalParticipant, trackPublication.kind == .video { notifyLocalVideoChanged() }
+        if let remote = participant as? RemoteParticipant {
+            let user = userFor(remote)
+            Task { @MainActor in self.delegate?.appEngine(self, userMediaChangedFor: user) }
+        }
+    }
+
+    public func room(_ room: Room, didUpdateSpeakingParticipants participants: [Participant]) {
+        let uids = participants.compactMap { $0.identity?.stringValue }
+        Task { @MainActor in self.delegate?.appEngine(self, activeSpeakersChanged: uids) }
     }
 
     public func room(_ room: Room, didUpdateConnectionState state: ConnectionState, from oldState: ConnectionState) {
