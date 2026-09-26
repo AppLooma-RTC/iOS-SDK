@@ -9,6 +9,7 @@ import Foundation
 import AppLoomaCore
 #if os(iOS)
 import AVFoundation
+import UIKit
 #endif
 
 /// Roles supported by AppLooma RTC channels.
@@ -38,6 +39,13 @@ public enum AppAudioScenario: Sendable {
     case call, media
 }
 
+/// Where the call's audio is going. A Bluetooth headset (AirPods, a car kit),
+/// when connected, wins by default; then wired headphones; then the
+/// loudspeaker (`.media`) or the earpiece (`.call`). See `AppEngine.setAudioRoute`.
+public enum AppAudioRoute: Sendable {
+    case bluetooth, wiredHeadset, earpiece, speaker
+}
+
 /// Which codec your camera is published with.
 ///
 /// `.auto` (default) publishes H.264 — hardware-encoded on every iPhone — with
@@ -45,6 +53,49 @@ public enum AppAudioScenario: Sendable {
 /// gets a picture. Force one only for a known fleet.
 public enum AppVideoCodec: Sendable {
     case auto, vp8, h264
+    /// H.265 — hardware-encoded on every iPhone since the 7, about 30 % fewer
+    /// bits than H.264 for the same picture. Opt-in; the VP8 backup layer still
+    /// rides along for viewers that cannot decode it.
+    case h265
+    /// AV1 is not available on iOS: no iPhone encodes it in hardware and the
+    /// software encoder cannot keep up at camera sizes. Falls back to `.auto`
+    /// with a warning; kept so one config compiles on every platform.
+    case av1
+}
+
+/// What the encoder gives up first when the network or the CPU cannot carry
+/// the full picture.
+///
+/// `.auto` (default) is the engine's choice for a camera — frame rate is kept
+/// and resolution drops, which looks smoothest in a call. `.keepResolution`
+/// keeps the picture sharp and drops frames instead — for a 1080p broadcast
+/// where crispness is the product. `.keepFramerate` keeps motion smooth and
+/// lets the picture soften. `.balanced` gives up a little of each.
+public enum AppVideoDegradation: Sendable {
+    case auto, keepResolution, keepFramerate, balanced
+}
+
+/// Which of your simulcast layers the numbers in `AppVideoQualityInfo` describe.
+public enum AppVideoLayer: Sendable {
+    case high, medium, low
+}
+
+/// Why the encoder is not sending the full picture, when it is not.
+public enum AppVideoQualityReason: Sendable {
+    case bandwidth, cpu, none
+}
+
+/// What your own camera is actually sending right now — the top layer that
+/// carries frames, its size, rate and bitrate, and why it is not the full
+/// picture if it is not. Delivered on `appEngine(_:videoQualityChanged:)`
+/// whenever any of it changes while the camera is on.
+public struct AppVideoQualityInfo: Sendable {
+    public let width: Int
+    public let height: Int
+    public let fps: Int
+    public let bitrateKbps: Int
+    public let layer: AppVideoLayer
+    public let reason: AppVideoQualityReason
 }
 
 /// Capture and encode settings for your own camera.
@@ -54,18 +105,31 @@ public enum AppVideoCodec: Sendable {
 /// `height` must be one of 360 / 540 / 720 / 1080; anything else snaps to the
 /// nearest preset (also logged).
 public struct AppVideoConfig: Sendable {
+    /// 360, 540, 720, 1080 or 1440 — the short edge of a 16:9 frame.
     public var height: Int
     public var fps: Int
+    /// Cap on the encoder's bitrate in bits per second; 0 = our default for the
+    /// height (5 Mbps at 1440p, 4 Mbps at 1080p, 2.2 Mbps at 720p, the preset
+    /// default below that).
     public var maxBitrate: Int
     public var simulcast: Bool
     public var codec: AppVideoCodec
+    /// What to give up first under pressure. See `AppVideoDegradation`.
+    public var degradation: AppVideoDegradation
+    /// Floor on the encoder's bitrate in bits per second; 0 = engine default.
+    /// Reserved: the engine exposes no per-sender minimum on iOS today, so the
+    /// value is kept but does not change what is sent.
+    public var minBitrate: Int
 
-    public init(height: Int = 1080, fps: Int = 30, maxBitrate: Int = 0, simulcast: Bool = true, codec: AppVideoCodec = .auto) {
+    public init(height: Int = 1080, fps: Int = 30, maxBitrate: Int = 0, simulcast: Bool = true, codec: AppVideoCodec = .auto,
+                degradation: AppVideoDegradation = .auto, minBitrate: Int = 0) {
         self.height = height
         self.fps = fps
         self.maxBitrate = maxBitrate
         self.simulcast = simulcast
         self.codec = codec
+        self.degradation = degradation
+        self.minBitrate = minBitrate
     }
 }
 
@@ -239,6 +303,13 @@ public protocol AppEngineDelegate: AnyObject {
     func appEngine(_ engine: AppEngine, activeSpeakersChanged uids: [String])
     /// Someone muted or unmuted their camera or microphone.
     func appEngine(_ engine: AppEngine, userMediaChangedFor user: AppRemoteUser)
+    /// The size, rate or layer your own camera is sending changed — the encoder
+    /// stepped down for the network or the CPU, or came back up. Resolved from
+    /// sender statistics while your camera is on.
+    func appEngine(_ engine: AppEngine, videoQualityChanged quality: AppVideoQualityInfo)
+    /// The audio route changed — a headset was connected or taken off, or
+    /// `setAudioRoute` was called. `available` is what `audioRoutes` returns now.
+    func appEngine(_ engine: AppEngine, audioRouteChanged route: AppAudioRoute?, available: [AppAudioRoute])
 }
 
 // Default empty implementations so integrators override only what they need.
@@ -257,6 +328,8 @@ public extension AppEngineDelegate {
     func appEngine(_ engine: AppEngine, remoteStats stats: [AppRemoteStats]) {}
     func appEngine(_ engine: AppEngine, activeSpeakersChanged uids: [String]) {}
     func appEngine(_ engine: AppEngine, userMediaChangedFor user: AppRemoteUser) {}
+    func appEngine(_ engine: AppEngine, videoQualityChanged quality: AppVideoQualityInfo) {}
+    func appEngine(_ engine: AppEngine, audioRouteChanged route: AppAudioRoute?, available: [AppAudioRoute]) {}
 }
 
 /// Main entry point of the AppLooma RTC SDK.
@@ -295,38 +368,239 @@ public final class AppEngine {
         self.room = Room(roomOptions: Self.roomOptions(options))
         self.room.add(delegate: self)
         Self.configureAudioSession(for: options.audioScenario)
+        observeAudioRoute()
+    }
+
+    deinit {
+        if let routeObserver { NotificationCenter.default.removeObserver(routeObserver) }
+    }
+
+    // MARK: - Audio route
+
+    private var routeObserver: NSObjectProtocol?
+
+    private func observeAudioRoute() {
+        #if os(iOS)
+        routeObserver = NotificationCenter.default.addObserver(
+            forName: AVAudioSession.routeChangeNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            guard let self else { return }
+            let route = self.currentAudioRoute, available = self.audioRoutes
+            Task { @MainActor in self.delegate?.appEngine(self, audioRouteChanged: route, available: available) }
+        }
+        #endif
+    }
+
+    #if os(iOS)
+    private static func route(for port: AVAudioSession.Port) -> AppAudioRoute? {
+        switch port {
+        case .bluetoothHFP, .bluetoothA2DP, .bluetoothLE: return .bluetooth
+        case .headphones, .headsetMic, .usbAudio: return .wiredHeadset
+        case .builtInReceiver: return .earpiece
+        case .builtInSpeaker: return .speaker
+        default: return nil
+        }
+    }
+    #endif
+
+    /// The output audio is going to right now; nil when the session is not
+    /// active yet (before the first join).
+    public var currentAudioRoute: AppAudioRoute? {
+        #if os(iOS)
+        return AVAudioSession.sharedInstance().currentRoute.outputs.lazy.compactMap { Self.route(for: $0.portType) }.first
+        #else
+        return nil
+        #endif
+    }
+
+    /// The outputs that can be selected right now, best first: a Bluetooth
+    /// headset when one is connected, wired headphones, then the earpiece and
+    /// the loudspeaker. Feed it to an in-call route picker.
+    public var audioRoutes: [AppAudioRoute] {
+        #if os(iOS)
+        var routes: [AppAudioRoute] = []
+        for input in AVAudioSession.sharedInstance().availableInputs ?? [] {
+            if let r = Self.route(for: input.portType), r != .earpiece, r != .speaker, !routes.contains(r) { routes.append(r) }
+        }
+        #if canImport(UIKit)
+        if UIDevice.current.userInterfaceIdiom == .phone { routes.append(.earpiece) }
+        #else
+        routes.append(.earpiece)
+        #endif
+        routes.append(.speaker)
+        return routes
+        #else
+        return []
+        #endif
+    }
+
+    /// Send audio to one specific output — for an in-call route picker
+    /// ("iPhone / Speaker / AirPods"). Returns false when that output is not in
+    /// `audioRoutes` (nothing changes). A headset that connects later takes over
+    /// by itself, as it does for a phone call; the delegate's
+    /// `audioRouteChanged` reports every change.
+    @discardableResult
+    public func setAudioRoute(_ route: AppAudioRoute) -> Bool {
+        #if os(iOS)
+        let session = AVAudioSession.sharedInstance()
+        guard audioRoutes.contains(route) else { return false }
+        do {
+            switch route {
+            case .speaker:
+                try session.overrideOutputAudioPort(.speaker)
+            case .earpiece:
+                // `.media` sessions carry `.defaultToSpeaker`, under which
+                // clearing the override lands on the speaker again — drop it.
+                var opts = session.categoryOptions
+                opts.remove(.defaultToSpeaker)
+                if opts != session.categoryOptions { try session.setCategory(session.category, mode: session.mode, options: opts) }
+                try session.overrideOutputAudioPort(.none)
+                if let mic = session.availableInputs?.first(where: { $0.portType == .builtInMic }) { try session.setPreferredInput(mic) }
+            case .bluetooth, .wiredHeadset:
+                // Picking the headset's microphone as the preferred input moves
+                // the output with it, which is the only way to steer between two
+                // connected headsets without touching the category.
+                try session.overrideOutputAudioPort(.none)
+                if let input = session.availableInputs?.first(where: { Self.route(for: $0.portType) == route }) { try session.setPreferredInput(input) }
+            }
+            return true
+        } catch {
+            print("[AppLoomaRTC] setAudioRoute(\(route)): \(error)")
+            return false
+        }
+        #else
+        return false
+        #endif
+    }
+
+    /// Route audio to the loudspeaker (true) or the earpiece (false). A
+    /// connected Bluetooth or wired headset keeps priority either way.
+    public func setSpeakerphone(_ on: Bool) {
+        let routes = audioRoutes
+        if let headset = routes.first(where: { $0 == .bluetooth || $0 == .wiredHeadset }) { setAudioRoute(headset); return }
+        setAudioRoute(on ? .speaker : .earpiece)
     }
 
     /// The codec actually published, after `.auto` is resolved.
     public var publishedCodec: String { Self.resolveCodec(options.video.codec) }
 
+    // Own-camera quality, folded from sender statistics; reported on change only.
+    private var lastQuality: AppVideoQualityInfo?
+    private var lastVideoBytes: UInt64 = 0
+    private var lastVideoAt: Date?
+
+    /// Follow the sender statistics of a just-published camera track.
+    private func watchLocalVideo(_ track: Track) {
+        lastQuality = nil
+        lastVideoBytes = 0
+        lastVideoAt = nil
+        track.add(delegate: self)
+        Task { await track.set(reportStatistics: true) }
+    }
+
+    /// The top simulcast layer that carries frames right now, from one
+    /// statistics report of our own camera track.
+    private func reportLocalQuality(_ statistics: TrackStatistics) {
+        let streams = statistics.outboundRtpStream
+        guard !streams.isEmpty else { return }
+        let now = Date()
+        let bytes = streams.reduce(UInt64(0)) { $0 + ($1.bytesSent ?? 0) }
+        var kbps = 0
+        if let at = lastVideoAt, bytes >= lastVideoBytes {
+            let secs = max(0.5, now.timeIntervalSince(at))
+            kbps = Int(Double(bytes - lastVideoBytes) * 8 / secs / 1000)
+        }
+        lastVideoBytes = bytes
+        lastVideoAt = now
+        let active = streams.filter { ($0.framesPerSecond ?? 0) > 0 && ($0.frameHeight ?? 0) > 0 }
+        guard let top = active.max(by: { ($0.frameHeight ?? 0) < ($1.frameHeight ?? 0) }) else { return }
+        let h = Int(top.frameHeight ?? 0)
+        let configured = Self.snapHeight(options.video.height)
+        let layer: AppVideoLayer
+        switch top.rid {
+        case "f": layer = .high
+        case "h": layer = .medium
+        case "q": layer = .low
+        default: layer = h >= Int(Double(configured) * 0.75) ? .high : (h >= Int(Double(configured) * 0.4) ? .medium : .low)
+        }
+        let reason: AppVideoQualityReason
+        switch top.qualityLimitationReason {
+        case .some(.bandwidth): reason = AppVideoQualityReason.bandwidth
+        case .some(.cpu): reason = AppVideoQualityReason.cpu
+        default: reason = AppVideoQualityReason.none
+        }
+        let q = AppVideoQualityInfo(width: Int(top.frameWidth ?? 0), height: h,
+                                    fps: Int((top.framesPerSecond ?? 0).rounded()),
+                                    bitrateKbps: kbps, layer: layer, reason: reason)
+        let prev = lastQuality
+        lastQuality = q
+        guard let prev else { return } // the first sample is the baseline, not a change
+        let same = prev.width == q.width && prev.height == q.height && prev.layer == q.layer &&
+            prev.reason == q.reason && abs(prev.fps - q.fps) < 5
+        if !same {
+            Task { @MainActor in self.delegate?.appEngine(self, videoQualityChanged: q) }
+        }
+    }
+
     static func resolveCodec(_ c: AppVideoCodec) -> String {
         switch c {
         case .vp8: return "vp8"
         case .h264: return "h264"
+        // Hardware on every iPhone since the 7.
+        case .h265: return "h265"
+        // No iPhone encodes AV1 in hardware; software AV1 cannot keep up at camera sizes.
+        case .av1:
+            print("[AppLoomaRTC] AppVideoCodec.av1 is not available on iOS; using auto")
+            return "h264"
         // Every iPhone encodes H.264 in hardware; VP8 is software. A VP8 backup
         // layer covers any viewer that cannot decode the H.264 stream.
         case .auto: return "h264"
         }
     }
 
+    static let presetHeights = [360, 540, 720, 1080, 1440]
+
+    static func snapHeight(_ wanted: Int) -> Int {
+        presetHeights.min(by: { abs($0 - wanted) < abs($1 - wanted) }) ?? 1080
+    }
+
+    /// `.auto` leaves the engine's per-source default (frame rate first for a camera).
+    private static func degradation(_ d: AppVideoDegradation) -> DegradationPreference {
+        switch d {
+        case .keepResolution: return .maintainResolution
+        case .keepFramerate: return .maintainFramerate
+        case .balanced: return .balanced
+        case .auto: return .auto
+        }
+    }
+
     private static func roomOptions(_ o: AppEngineOptions) -> RoomOptions {
-        let heights = [360, 540, 720, 1080]
-        let height = heights.min(by: { abs($0 - o.video.height) < abs($1 - o.video.height) }) ?? 1080
+        let height = snapHeight(o.video.height)
         if height != o.video.height { print("[AppLoomaRTC] AppVideoConfig.height=\(o.video.height) is not a preset; using \(height)p") }
         if o.video.maxBitrate > 0 && o.video.maxBitrate < 10_000 {
             print("[AppLoomaRTC] AppVideoConfig.maxBitrate=\(o.video.maxBitrate) is in bits per second — did you mean \(o.video.maxBitrate)_000 (kbps)?")
         }
+        // Our own caps for the sharp end: the preset defaults were tuned for
+        // calls and leave 1080p visibly soft on a good link. 540p and below
+        // keep theirs. minBitrate: the engine's encoding carries no floor on
+        // iOS, so AppVideoConfig.minBitrate is not applied here.
         let dimensions: Dimensions
-        let presetBitrate: Int
+        let defaultBitrate: Int
         switch height {
-        case 360: dimensions = .h360_169; presetBitrate = 400_000
-        case 540: dimensions = .h540_169; presetBitrate = 800_000
-        case 720: dimensions = .h720_169; presetBitrate = 1_700_000
-        default: dimensions = .h1080_169; presetBitrate = 3_000_000
+        case 360: dimensions = .h360_169; defaultBitrate = 400_000
+        case 540: dimensions = .h540_169; defaultBitrate = 800_000
+        case 720: dimensions = .h720_169; defaultBitrate = 2_200_000
+        case 1440: dimensions = .h1440_169; defaultBitrate = 5_000_000
+        default: dimensions = .h1080_169; defaultBitrate = 4_000_000
         }
-        let encoding = VideoEncoding(maxBitrate: o.video.maxBitrate > 0 ? o.video.maxBitrate : presetBitrate, maxFps: o.video.fps)
+        let encoding = VideoEncoding(maxBitrate: o.video.maxBitrate > 0 ? o.video.maxBitrate : defaultBitrate, maxFps: o.video.fps)
         let codec = resolveCodec(o.video.codec)
+        let preferred: VideoCodec
+        switch codec {
+        case "h264": preferred = .h264
+        case "h265": preferred = .h265
+        default: preferred = .vp8
+        }
         return RoomOptions(
             defaultCameraCaptureOptions: CameraCaptureOptions(dimensions: dimensions),
             defaultAudioCaptureOptions: AudioCaptureOptions(
@@ -337,11 +611,12 @@ public final class AppEngine {
             defaultVideoPublishOptions: VideoPublishOptions(
                 encoding: encoding,
                 simulcast: o.video.simulcast,
-                preferredCodec: codec == "h264" ? .h264 : .vp8,
-                // When H.264 is published, a VP8 layer rides along as backup so a
-                // viewer whose device cannot decode it is served VP8 by the server
+                preferredCodec: preferred,
+                // Anything but VP8 rides with a VP8 backup layer so a viewer
+                // whose device cannot decode it is served VP8 by the server
                 // instead of a black frame.
-                preferredBackupCodec: codec == "h264" ? .vp8 : nil
+                preferredBackupCodec: codec == "vp8" ? nil : .vp8,
+                degradationPreference: degradation(o.video.degradation)
             ),
             defaultAudioPublishOptions: AudioPublishOptions(
                 encoding: AudioEncoding(maxBitrate: 96_000),
@@ -589,6 +864,9 @@ public final class AppEngine {
         statsTimer = nil
         health.removeAll()
         trackOwner.removeAll()
+        lastQuality = nil
+        lastVideoBytes = 0
+        lastVideoAt = nil
     }
 }
 
@@ -634,11 +912,18 @@ extension AppEngine: RoomDelegate {
     // Our own camera was published, unpublished, or its track swapped on
     // mute/unmute: the moment self-views must re-bind.
     public func room(_ room: Room, participant: LocalParticipant, didPublishTrack publication: LocalTrackPublication) {
-        if publication.kind == .video { notifyLocalVideoChanged() }
+        if publication.kind == .video {
+            if publication.source == .camera, let track = publication.track { watchLocalVideo(track) }
+            notifyLocalVideoChanged()
+        }
     }
 
     public func room(_ room: Room, participant: LocalParticipant, didUnpublishTrack publication: LocalTrackPublication) {
-        if publication.kind == .video { notifyLocalVideoChanged() }
+        if publication.kind == .video {
+            publication.track?.remove(delegate: self)
+            lastQuality = nil
+            notifyLocalVideoChanged()
+        }
     }
 
     public func room(_ room: Room, participant: Participant, trackPublication: TrackPublication, didUpdateIsMuted isMuted: Bool) {
@@ -709,6 +994,11 @@ extension AppEngine: RoomDelegate {
 
 extension AppEngine: TrackDelegate {
     public func track(_ track: Track, didUpdateStatistics statistics: TrackStatistics, simulcastStatistics: [VideoCodec: TrackStatistics]) {
+        // Our own camera: sender statistics, not a remote user's health.
+        if track is LocalTrack {
+            if track.kind == .video { reportLocalQuality(statistics) }
+            return
+        }
         guard let sid = track.sid?.stringValue, let uid = trackOwner[sid], let h = health[uid] else { return }
         for s in statistics.inboundRtpStream {
             if track.kind == .video {
