@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.5.1
 
 - `AppVideoConfig.degradation` — `.keepResolution` / `.keepFramerate` / `.balanced` / `.auto` (what the encoder gives up first under pressure), applied through the engine's publish defaults; `AppVideoConfig.minBitrate` (reserved — the engine exposes no per-sender floor on iOS yet).
 - Default bitrate caps raised when `maxBitrate` is 0: 4 Mbps at 1080p, 2.2 Mbps at 720p (was 3 / 1.7). New `height: 1440` preset (2560×1440, 5 Mbps, 30 fps).
