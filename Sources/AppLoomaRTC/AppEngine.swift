@@ -339,6 +339,13 @@ public protocol AppEngineDelegate: AnyObject {
     /// The audio route changed — a headset was connected or taken off, or
     /// `setAudioRoute` was called. `available` is what `audioRoutes` returns now.
     func appEngine(_ engine: AppEngine, audioRouteChanged route: AppAudioRoute?, available: [AppAudioRoute])
+    /// Automatic codec recovery republished your camera on a safer path,
+    /// because viewers were receiving it but could not show a picture. For
+    /// logs and support; the app has nothing to do. At most once per join.
+    /// `from` / `to` are codec names (`"h264"` → `"vp8"`); a camera already on
+    /// VP8 is republished as a single layer (`"vp8"` → `"vp8:single"`).
+    /// `reason` is `"no_frames"`, `"encoder_error"` or `"viewers_cannot_decode"`.
+    func appEngine(_ engine: AppEngine, videoCodecFallbackFrom from: String, to: String, reason: String)
 }
 
 // Default empty implementations so integrators override only what they need.
@@ -359,6 +366,7 @@ public extension AppEngineDelegate {
     func appEngine(_ engine: AppEngine, userMediaChangedFor user: AppRemoteUser) {}
     func appEngine(_ engine: AppEngine, videoQualityChanged quality: AppVideoQualityInfo) {}
     func appEngine(_ engine: AppEngine, audioRouteChanged route: AppAudioRoute?, available: [AppAudioRoute]) {}
+    func appEngine(_ engine: AppEngine, videoCodecFallbackFrom from: String, to: String, reason: String) {}
 }
 
 /// Main entry point of the AppLooma RTC SDK.
@@ -379,6 +387,9 @@ public final class AppEngine {
     private final class Health {
         var fps = 0, width = 0, height = 0, freezes = 0, vLost = 0, aLost = 0, jitterMs = 0
         var firstFrameReported = false
+        // Automatic codec recovery, viewer side.
+        var noFrameSince: Date?
+        var lastReportAt: Date?
     }
     private var health: [String: Health] = [:]
     private var trackOwner: [String: String] = [:] // track sid -> uid
@@ -512,6 +523,10 @@ public final class AppEngine {
 
     /// The codec actually published, after `.auto` is resolved.
     public var publishedCodec: String {
+        codecOverride ?? configuredCodec
+    }
+
+    private var configuredCodec: String {
         options.video.codec == .auto && options.video.mode == .ultraHd4k && Self.isUltraHdSupported() ? "h265" : Self.resolveCodec(options.video.codec)
     }
 
@@ -619,7 +634,7 @@ public final class AppEngine {
         }
     }
 
-    private static func roomOptions(_ o: AppEngineOptions) -> RoomOptions {
+    private static func roomOptions(_ o: AppEngineOptions, codecOverride: String? = nil, simulcastOverride: Bool? = nil) -> RoomOptions {
         var mode = o.video.mode
         if mode == .ultraHd4k && !isUltraHdSupported() {
             print("[AppLoomaRTC] AppVideoMode.ultraHd4k is not supported on this device; using stableHd")
@@ -631,7 +646,7 @@ public final class AppEngine {
             print("[AppLoomaRTC] AppVideoConfig.maxBitrate=\(o.video.maxBitrate) is in bits per second — did you mean \(o.video.maxBitrate)_000 (kbps)?")
         }
         // In .ultraHd4k, .auto prefers H.265 (hardware on every supported iPhone).
-        let codec = o.video.codec == .auto && mode == .ultraHd4k ? "h265" : resolveCodec(o.video.codec)
+        let codec = codecOverride ?? (o.video.codec == .auto && mode == .ultraHd4k ? "h265" : resolveCodec(o.video.codec))
         // Our own caps. `.adaptive` keeps the earlier sharp-end caps (the
         // preset defaults were tuned for calls and leave 1080p visibly soft);
         // 540p and below keep theirs. minBitrate: the engine's encoding
@@ -649,7 +664,7 @@ public final class AppEngine {
         default: dimensions = .h1080_169; defaultBitrate = adaptive ? 4_000_000 : 3_500_000
         }
         let encoding = VideoEncoding(maxBitrate: o.video.maxBitrate > 0 ? o.video.maxBitrate : defaultBitrate, maxFps: o.video.fps)
-        let simulcast = o.video.simulcast ?? adaptive
+        let simulcast = simulcastOverride ?? o.video.simulcast ?? adaptive
         let wantedDegradation: AppVideoDegradation = o.video.degradation == .auto && !adaptive ? .keepResolution : o.video.degradation
         let preferred: VideoCodec
         switch codec {
@@ -736,6 +751,10 @@ public final class AppEngine {
     public func joinChannel(token: String, wsUrl: String, options: AppJoinOptions = AppJoinOptions()) async throws {
         guard !isJoined else { throw AppError.alreadyJoined }
         joinStartedAt = Date()
+        fallbackUsed = false
+        viewerReports.removeAll()
+        joinToken = token
+        reportedOutcomes.removeAll()
         // Auto-subscribe so an audience member (and every co-host) receives all
         // published tracks the moment they join.
         try await room.connect(url: wsUrl, token: token, connectOptions: ConnectOptions(autoSubscribe: true))
@@ -914,7 +933,105 @@ public final class AppEngine {
                                audioPacketsLost: h.aLost, audioJitterMs: h.jitterMs)
             }
             if !stats.isEmpty { self.delegate?.appEngine(self, remoteStats: stats) }
+            for (uid, h) in self.health { self.checkUndecodable(uid: uid, health: h) }
         }
+    }
+
+    // MARK: - Automatic codec recovery
+
+    /// Reserved data topics: anything starting with `_al.` is SDK-internal and
+    /// never reaches `messageReceived` or `dataReceived`.
+    static let internalTopicPrefix = "_al."
+    static let videoReportTopic = "_al.vq"
+
+    private var codecOverride: String?
+    private var simulcastOverride: Bool?
+    private var viewerReports: [String: Date] = [:]
+    private var fallbackUsed = false
+    // Anonymous device reports: at most one per outcome and codec per join.
+    private var joinToken: String?
+    private var reportedOutcomes = Set<String>()
+
+    private func reportDevice(_ outcome: String, codec: String, fromCodec: String? = nil, toCodec: String? = nil) {
+        guard reportedOutcomes.insert("\(outcome):\(codec)").inserted else { return }
+        DeviceReports.send(token: joinToken, outcome: outcome, codec: codec, fromCodec: fromCodec, toCodec: toCodec)
+    }
+
+    /// Viewer side: a subscribed, enabled camera whose sender has it on,
+    /// decoding nothing for more than 6 s. Tell that publisher only, at most
+    /// once per 20 s.
+    private func checkUndecodable(uid: String, health h: Health) {
+        let now = Date()
+        let pub = users[uid]?.raw.videoTracks.first as? RemoteTrackPublication
+        guard let pub, pub.isSubscribed, pub.isEnabled, !pub.isMuted, h.fps == 0 else {
+            h.noFrameSince = nil
+            return
+        }
+        let since = h.noFrameSince ?? now
+        h.noFrameSince = since
+        guard now.timeIntervalSince(since) > 6 else { return }
+        if let last = h.lastReportAt, now.timeIntervalSince(last) < 20 { return }
+        h.lastReportAt = now
+        let body: [String: Any] = ["v": 1, "t": "no_frames", "codec": pub.mimeType]
+        guard let data = try? JSONSerialization.data(withJSONObject: body) else { return }
+        Task {
+            try? await self.room.localParticipant.publish(
+                data: data,
+                options: DataPublishOptions(destinationIdentities: [Participant.Identity(from: uid)], topic: Self.videoReportTopic, reliable: true)
+            )
+        }
+    }
+
+    /// Publisher side: a viewer reports no picture from our camera.
+    fileprivate func onVideoReport(_ data: Data, from participant: RemoteParticipant?) {
+        guard let viewer = participant?.identity?.stringValue,
+              let msg = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              msg["t"] as? String == "no_frames" else { return }
+        guard let pub = room.localParticipant.videoTracks.first(where: { $0.source == .camera }),
+              pub.track != nil, !pub.isMuted else { return }
+        let now = Date()
+        viewerReports[viewer] = now
+        viewerReports = viewerReports.filter { now.timeIntervalSince($0.value) <= 20 }
+        reportDevice("viewers_cannot_decode", codec: publishedCodec)
+        // Two distinct viewers within 20 s, or the only other person in a 1:1.
+        if viewerReports.count >= 2 || room.remoteParticipants.count <= 1 {
+            Task { await self.fallBack(reason: "viewers_cannot_decode") }
+        }
+    }
+
+    /// Republish the camera on a safer path: VP8 when it was on anything
+    /// else, otherwise once more as a single layer. At most once per join.
+    private func fallBack(reason: String) async {
+        guard !fallbackUsed,
+              let pub = room.localParticipant.videoTracks.first(where: { $0.source == .camera }) as? LocalTrackPublication,
+              pub.track != nil else { return }
+        fallbackUsed = true
+        let from = publishedCodec
+        let to: String
+        if from != "vp8" {
+            codecOverride = "vp8"
+            to = "vp8"
+        } else {
+            simulcastOverride = false
+            to = "vp8:single"
+        }
+        print("[AppLoomaRTC] codec recovery: \(from) -> \(to) (\(reason))")
+        reportDevice("fallback", codec: from, fromCodec: from, toCodec: "vp8")
+        let recovered = Self.roomOptions(options, codecOverride: codecOverride, simulcastOverride: simulcastOverride)
+        let publish = recovered.defaultVideoPublishOptions
+        // Come back on the camera in use (front or back), not the default one.
+        let defaults = recovered.defaultCameraCaptureOptions
+        let position = ((pub.track as? LocalVideoTrack)?.capturer as? CameraCapturer)?.position ?? defaults.position
+        let capture = CameraCaptureOptions(position: position, dimensions: defaults.dimensions, fps: defaults.fps)
+        do {
+            try await room.localParticipant.unpublish(publication: pub)
+            try await room.localParticipant.setCamera(enabled: true, captureOptions: capture, publishOptions: publish)
+        } catch {
+            print("[AppLoomaRTC] codec recovery failed: \(error)")
+            return
+        }
+        notifyLocalVideoChanged()
+        Task { @MainActor in self.delegate?.appEngine(self, videoCodecFallbackFrom: from, to: to, reason: reason) }
     }
 
     private func stopStats() {
@@ -1020,6 +1137,11 @@ extension AppEngine: RoomDelegate {
     }
 
     public func room(_ room: Room, participant: RemoteParticipant?, didReceiveData data: Data, forTopic topic: String, encryptionType: EncryptionType) {
+        // SDK-internal traffic never reaches the app.
+        if topic.hasPrefix(Self.internalTopicPrefix) {
+            if topic == Self.videoReportTopic { onVideoReport(data, from: participant) }
+            return
+        }
         let user = participant.map { userFor($0) }
 
         // Each frame is either ours or the customer's, never both. Reporting our
@@ -1107,5 +1229,56 @@ public struct AppGiftEvent: Decodable {
               let decoded = try? JSONDecoder().decode(AppGiftEvent.self, from: data)
         else { return nil }
         return decoded
+    }
+}
+
+
+// MARK: - Anonymous device reports
+
+/// How the video encoder behaved on this phone (POST /v1/sdk/device-report).
+/// Fire-and-forget: every error is swallowed, a call is never affected.
+enum DeviceReports {
+    static let sdkVersion = "0.5.3"
+    static let apiBase = "https://api.applooma.dev/v1"
+
+    private static func clean(_ s: String, _ max: Int) -> String {
+        let allowed = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 ._-+/(),:#")
+        let mapped = String(s.unicodeScalars.map { allowed.contains($0) ? Character($0) : " " })
+        let t = String(mapped.trimmingCharacters(in: .whitespaces).prefix(max))
+        return t.isEmpty ? "unknown" : t
+    }
+
+    /// Hardware identifier such as "iPhone15,2".
+    private static var model: String {
+        var info = utsname()
+        uname(&info)
+        let id = withUnsafeBytes(of: &info.machine) { raw in
+            String(decoding: raw.prefix(while: { $0 != 0 }), as: UTF8.self)
+        }
+        return clean(id, 96)
+    }
+
+    static func send(token: String?, outcome: String, codec: String, fromCodec: String? = nil, toCodec: String? = nil) {
+        guard let token, !token.isEmpty, let url = URL(string: "\(apiBase)/sdk/device-report") else { return }
+        let v = ProcessInfo.processInfo.operatingSystemVersion
+        var report: [String: String] = [
+            "sdkPlatform": "ios",
+            "sdkVersion": sdkVersion,
+            "osName": "iOS",
+            "osVersion": "\(v.majorVersion).\(v.minorVersion).\(v.patchVersion)",
+            "manufacturer": "Apple",
+            "model": model,
+            "codec": codec,
+            "outcome": outcome,
+        ]
+        if let fromCodec { report["fromCodec"] = fromCodec }
+        if let toCodec { report["toCodec"] = toCodec }
+        guard let body = try? JSONSerialization.data(withJSONObject: ["reports": [report]]) else { return }
+        var req = URLRequest(url: url, timeoutInterval: 3)
+        req.httpMethod = "POST"
+        req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = body
+        URLSession.shared.dataTask(with: req) { _, _, _ in }.resume()
     }
 }

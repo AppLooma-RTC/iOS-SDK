@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- Automatic codec recovery. Viewer side: a subscribed, enabled remote camera that decodes no picture for more than 6 s while its sender has it on is reported to that publisher only, on a reserved internal data topic. Internal topics (prefix `_al.`) are never delivered to the app's message or data callbacks.
+- Publisher side: reports from 2 different viewers within 20 s (or from the only other person in a 1:1 call) republish the camera on a safer path: VP8 when it was on another codec, otherwise once more as a single layer. At most once per join.
+- New `AppEngineDelegate.appEngine(_:videoCodecFallbackFrom:to:reason:)`; `reason` is `no_frames`, `encoder_error` or `viewers_cannot_decode`. `publishedCodec` reflects the switch.
+- Anonymous device reports (model identifier, OS and SDK version, codec and outcome; no user, identity or IP address) are sent on a codec fallback or a viewer report, so the platform can tune settings per device model. Fire-and-forget; failures are silent.
+- Fixed: after a codec-recovery republish the camera came back on the front camera; it now keeps the camera that was in use.
+
 ## 0.5.3
 
 - UIKit: loudspeaker button on the live stream (host and viewer), voice room and call screens. Speaker icon when on, speaker-off when on the earpiece; while a Bluetooth or wired headset carries the audio it shows headphones, does nothing and reads "Headset in use". VoiceOver labels "Loudspeaker on"/"Loudspeaker off". Starts on the loudspeaker for live, voice rooms and video calls, on the earpiece for voice calls (iPad stays on the loudspeaker).
