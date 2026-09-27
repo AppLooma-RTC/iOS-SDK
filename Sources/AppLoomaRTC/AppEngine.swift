@@ -175,16 +175,29 @@ public struct AppAudioOptions: Sendable {
     }
 }
 
+/// Which server region the engine should prefer.
+///
+/// Preparation for multi-region: today every region connects to the same
+/// server URL your token endpoint returns. The value is sent with the SDK's
+/// anonymous device reports and logged on join.
+public enum AppRegion: String, Sendable {
+    case auto, bd, `in`, sa, sg, us
+}
+
 /// Engine-wide settings. All optional; the defaults are what most apps want.
 public struct AppEngineOptions: Sendable {
     public var audioScenario: AppAudioScenario
     public var video: AppVideoConfig
     public var audio: AppAudioOptions
+    /// Preferred server region; `.auto` by default. See `AppRegion`.
+    public var region: AppRegion
 
-    public init(audioScenario: AppAudioScenario = .call, video: AppVideoConfig = AppVideoConfig(), audio: AppAudioOptions = AppAudioOptions()) {
+    public init(audioScenario: AppAudioScenario = .call, video: AppVideoConfig = AppVideoConfig(), audio: AppAudioOptions = AppAudioOptions(),
+                region: AppRegion = .auto) {
         self.audioScenario = audioScenario
         self.video = video
         self.audio = audio
+        self.region = region
     }
 }
 
@@ -346,6 +359,10 @@ public protocol AppEngineDelegate: AnyObject {
     /// VP8 is republished as a single layer (`"vp8"` → `"vp8:single"`).
     /// `reason` is `"no_frames"`, `"encoder_error"` or `"viewers_cannot_decode"`.
     func appEngine(_ engine: AppEngine, videoCodecFallbackFrom from: String, to: String, reason: String)
+    /// The join token expires in about 30 seconds (immediately, when less than
+    /// that was left at join or at `renewToken`). Fetch a new one from your
+    /// server and pass it to `renewToken(_:)`.
+    func appEngine(_ engine: AppEngine, tokenWillExpire token: String)
 }
 
 // Default empty implementations so integrators override only what they need.
@@ -367,6 +384,7 @@ public extension AppEngineDelegate {
     func appEngine(_ engine: AppEngine, videoQualityChanged quality: AppVideoQualityInfo) {}
     func appEngine(_ engine: AppEngine, audioRouteChanged route: AppAudioRoute?, available: [AppAudioRoute]) {}
     func appEngine(_ engine: AppEngine, videoCodecFallbackFrom from: String, to: String, reason: String) {}
+    func appEngine(_ engine: AppEngine, tokenWillExpire token: String) {}
 }
 
 /// Main entry point of the AppLooma RTC SDK.
@@ -755,6 +773,7 @@ public final class AppEngine {
         viewerReports.removeAll()
         joinToken = token
         reportedOutcomes.removeAll()
+        print("[AppLoomaRTC] joining (region: \(self.options.region.rawValue))")
         // Auto-subscribe so an audience member (and every co-host) receives all
         // published tracks the moment they join.
         try await room.connect(url: wsUrl, token: token, connectOptions: ConnectOptions(autoSubscribe: true))
@@ -767,6 +786,7 @@ public final class AppEngine {
         // joining a live stream sees nobody and never receives the host's video.
         seedExistingParticipants()
         startStats()
+        armTokenExpiry()
 
         if options.role != .audience {
             if options.microphone { try await room.localParticipant.setMicrophone(enabled: true) }
@@ -776,6 +796,7 @@ public final class AppEngine {
 
     public func leaveChannel() async {
         stopStats()
+        cancelTokenExpiry()
         await room.disconnect()
         isJoined = false
         users.removeAll()
@@ -954,7 +975,7 @@ public final class AppEngine {
 
     private func reportDevice(_ outcome: String, codec: String, fromCodec: String? = nil, toCodec: String? = nil) {
         guard reportedOutcomes.insert("\(outcome):\(codec)").inserted else { return }
-        DeviceReports.send(token: joinToken, outcome: outcome, codec: codec, fromCodec: fromCodec, toCodec: toCodec)
+        DeviceReports.send(token: joinToken, region: options.region.rawValue, outcome: outcome, codec: codec, fromCodec: fromCodec, toCodec: toCodec)
     }
 
     /// Viewer side: a subscribed, enabled camera whose sender has it on,
@@ -1032,6 +1053,49 @@ public final class AppEngine {
         }
         notifyLocalVideoChanged()
         Task { @MainActor in self.delegate?.appEngine(self, videoCodecFallbackFrom: from, to: to, reason: reason) }
+    }
+
+    // MARK: - Token renewal
+
+    private var tokenExpiryTimer: Timer?
+
+    /// Replace the token the SDK keeps for its own later calls (device reports)
+    /// and re-arm `tokenWillExpire`. While connected, the media server already
+    /// refreshes the live connection's own credential, so the call itself is
+    /// not interrupted. Stored even when not joined.
+    public func renewToken(_ token: String) {
+        joinToken = token
+        if isJoined { armTokenExpiry() }
+    }
+
+    /// `exp` (seconds since 1970) from a JWT's payload, decoded locally.
+    static func tokenExpiry(_ token: String) -> Date? {
+        let parts = token.split(separator: ".")
+        guard parts.count >= 2 else { return nil }
+        var b64 = String(parts[1]).replacingOccurrences(of: "-", with: "+").replacingOccurrences(of: "_", with: "/")
+        while b64.count % 4 != 0 { b64 += "=" }
+        guard let data = Data(base64Encoded: b64),
+              let payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let exp = (payload["exp"] as? NSNumber)?.doubleValue else { return nil }
+        return Date(timeIntervalSince1970: exp)
+    }
+
+    private func armTokenExpiry() {
+        cancelTokenExpiry()
+        guard let token = joinToken, let exp = Self.tokenExpiry(token) else { return }
+        // Less than 30 s left: fire (almost) immediately.
+        let delay = max(0.05, exp.timeIntervalSinceNow - 30)
+        let timer = Timer(timeInterval: delay, repeats: false) { [weak self] _ in
+            guard let self, self.isJoined, self.joinToken == token else { return }
+            self.delegate?.appEngine(self, tokenWillExpire: token)
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        tokenExpiryTimer = timer
+    }
+
+    private func cancelTokenExpiry() {
+        tokenExpiryTimer?.invalidate()
+        tokenExpiryTimer = nil
     }
 
     private func stopStats() {
@@ -1125,6 +1189,7 @@ extension AppEngine: RoomDelegate {
         if case .disconnected = state {
             isJoined = false
             stopStats()
+            cancelTokenExpiry()
             // Report everyone as gone; a stale roster after a disconnect made
             // remoteUsers wrong until the next join.
             let gone = Array(users.values)
@@ -1258,7 +1323,7 @@ enum DeviceReports {
         return clean(id, 96)
     }
 
-    static func send(token: String?, outcome: String, codec: String, fromCodec: String? = nil, toCodec: String? = nil) {
+    static func send(token: String?, region: String = "auto", outcome: String, codec: String, fromCodec: String? = nil, toCodec: String? = nil) {
         guard let token, !token.isEmpty, let url = URL(string: "\(apiBase)/sdk/device-report") else { return }
         let v = ProcessInfo.processInfo.operatingSystemVersion
         var report: [String: String] = [
@@ -1270,6 +1335,7 @@ enum DeviceReports {
             "model": model,
             "codec": codec,
             "outcome": outcome,
+            "region": region,
         ]
         if let fromCodec { report["fromCodec"] = fromCodec }
         if let toCodec { report["toCodec"] = toCodec }
