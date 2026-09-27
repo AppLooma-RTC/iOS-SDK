@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.5.2
 
 - `AppVideoMode` on `AppVideoConfig.mode`: `.stableHd` (new default), `.ultraHd4k` (premium, opt-in), `.adaptive` (the previous behaviour). `.stableHd` publishes one 1080p30 layer at 3.5 Mbps (no simulcast), keeps resolution under pressure and turns adaptive stream off so receivers keep the full picture.
 - `.ultraHd4k`: 2160p30 (3840x2160), one layer, H.265 at 16 Mbps (25 Mbps if H.264 is forced), resolution kept. `AppEngine.isUltraHdSupported()` — true on every supported iPhone.
