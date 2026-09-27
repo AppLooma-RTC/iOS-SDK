@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.5.6 — 2026-09-28
 
 - Cloud proxy for restrictive networks: `AppEngineOptions.cloudProxy` (`AppCloudProxy.auto` default, `.forceTls443`, `.off`). `.forceTls443` joins with relay-only transport through AppLooma's relay on TLS 443; `.auto` retries a join once that way when the direct join fails with a connection or network timeout, and logs it. New `AppEngineDelegate.appEngine(_:proxyStateChanged:autoRetry:)`, `AppProxyState` (`.direct`, `.connecting`, `.connected`) and `AppEngine.proxyState`.
 - Pre-call network test: `startNetworkTest(serverUrl:token:completion:)` / `stopNetworkTest()`, a separate ~5 s connection (nothing published, 10 s timeout) returning `AppNetworkTestResult` with `AppNetworkQuality`. Quality only on iOS for now (`rttMs`/`jitterMs` -1, loss 0). No echo test.
