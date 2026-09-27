@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Cloud proxy for restrictive networks: `AppEngineOptions.cloudProxy` (`AppCloudProxy.auto` default, `.forceTls443`, `.off`). `.forceTls443` joins with relay-only transport through AppLooma's relay on TLS 443; `.auto` retries a join once that way when the direct join fails with a connection or network timeout, and logs it. New `AppEngineDelegate.appEngine(_:proxyStateChanged:autoRetry:)`, `AppProxyState` (`.direct`, `.connecting`, `.connected`) and `AppEngine.proxyState`.
+- Pre-call network test: `startNetworkTest(serverUrl:token:completion:)` / `stopNetworkTest()`, a separate ~5 s connection (nothing published, 10 s timeout) returning `AppNetworkTestResult` with `AppNetworkQuality`. Quality only on iOS for now (`rttMs`/`jitterMs` -1, loss 0). No echo test.
+- Network fallback: `setRemoteSubscribeFallback(_:)` / `setLocalPublishFallback(_:)` with `AppFallbackOption` (`.none`, `.videoLowQuality`, `.audioOnly`); poor or lost for about 4 s falls back, good for about 10 s restores. New `appEngine(_:fallbackStateChanged:isLocal:)`. Local `.videoLowQuality` republishes the camera at 30 % bitrate.
+- Device tuning: the server's per-device video config (`forceCodec`, `preferCodec`, `maxHeight`, `maxFps`, `maxBitrateKbps`, `disableSimulcast`, `denyHardware` mapped to the next safer codec) is cached on the device, applied at join and refreshed in the background (3 s timeout, ETag and ttl) for the next join.
+
 ## 0.5.5 — 2026-09-27
 
 - Remote diagnostics: the SDK keeps its recent log lines and a stats snapshot every 10 s in memory (no audio, video or messages) and uploads them, scrubbed of names, metadata, user ids, tokens and URL parameters, after a call with a problem (codec fallback, a viewer reporting no picture, join failure, 3 or more reconnects), when support turned collection on for the device or project, or on the new `AppEngine.uploadDiagnostics(reason:)`. Opt out with `AppEngineOptions(remoteDiagnostics: false)`. Kept 14 days.

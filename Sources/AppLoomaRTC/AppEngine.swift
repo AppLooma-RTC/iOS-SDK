@@ -198,15 +198,64 @@ public struct AppEngineOptions: Sendable {
     /// or project, or when you call `uploadDiagnostics(reason:)`. Kept 14
     /// days. `false` turns every upload off.
     public var remoteDiagnostics: Bool
+    /// Cloud proxy for networks that block UDP or most ports; `.auto` by
+    /// default. See `AppCloudProxy` and `proxyStateChanged`.
+    public var cloudProxy: AppCloudProxy
 
     public init(audioScenario: AppAudioScenario = .call, video: AppVideoConfig = AppVideoConfig(), audio: AppAudioOptions = AppAudioOptions(),
-                region: AppRegion = .auto, remoteDiagnostics: Bool = true) {
+                region: AppRegion = .auto, remoteDiagnostics: Bool = true, cloudProxy: AppCloudProxy = .auto) {
         self.audioScenario = audioScenario
         self.video = video
         self.audio = audio
         self.region = region
         self.remoteDiagnostics = remoteDiagnostics
+        self.cloudProxy = cloudProxy
     }
+}
+
+/// Cloud proxy for restrictive networks (office firewalls, UDP blocked).
+/// `.auto` connects directly and, when that join fails with a connection or
+/// network timeout, retries once through AppLooma's relay on TLS port 443.
+/// `.forceTls443` always relays on TLS 443. `.off` never relays.
+public enum AppCloudProxy: Sendable {
+    case auto, forceTls443, off
+}
+
+/// `.direct`: media is not relayed (also after leaving). `.connecting`:
+/// joining through the relay on TLS 443. `.connected`: in the channel
+/// through the relay.
+public enum AppProxyState: Sendable {
+    case direct, connecting, connected
+}
+
+/// Network quality as estimated by the media server. Higher raw values are worse.
+public enum AppNetworkQuality: Int, Sendable {
+    case unknown, excellent, good, poor, lost
+}
+
+/// What the SDK gives up when the network cannot carry everything. `.none`
+/// keeps everything (default); `.videoLowQuality` drops to the low layer
+/// (receiving) or a lower bitrate (sending); `.audioOnly` drops video until
+/// the network recovers. See `setRemoteSubscribeFallback(_:)` and
+/// `setLocalPublishFallback(_:)`.
+public enum AppFallbackOption: Sendable {
+    case none, videoLowQuality, audioOnly
+}
+
+/// The result of `AppEngine.startNetworkTest(serverUrl:token:completion:)`.
+public struct AppNetworkTestResult: Sendable {
+    public let uplinkQuality: AppNetworkQuality
+    public let downlinkQuality: AppNetworkQuality
+    /// Round-trip time in milliseconds, -1 when unknown (always -1 on iOS today).
+    public let rttMs: Int
+    /// Incoming jitter in milliseconds, -1 when unknown (always -1 on iOS today).
+    public let jitterMs: Int
+    /// Fraction of outgoing packets lost, 0...1 (not measured on iOS today).
+    public let uplinkLoss: Float
+    /// Fraction of incoming packets lost, 0...1 (not measured on iOS today).
+    public let downlinkLoss: Float
+    /// Set when the test could not run or did not finish.
+    public let error: String?
 }
 
 /// Per-remote-user media health, delivered every two seconds while joined.
@@ -371,6 +420,13 @@ public protocol AppEngineDelegate: AnyObject {
     /// that was left at join or at `renewToken`). Fetch a new one from your
     /// server and pass it to `renewToken(_:)`.
     func appEngine(_ engine: AppEngine, tokenWillExpire token: String)
+    /// A network fallback set with `setRemoteSubscribeFallback(_:)` (isLocal
+    /// false) or `setLocalPublishFallback(_:)` (isLocal true) took effect;
+    /// `.none` means everything was restored.
+    func appEngine(_ engine: AppEngine, fallbackStateChanged state: AppFallbackOption, isLocal: Bool)
+    /// The cloud proxy state changed (see `AppEngineOptions.cloudProxy`).
+    /// `autoRetry` is true when the relay is used because the direct join failed.
+    func appEngine(_ engine: AppEngine, proxyStateChanged state: AppProxyState, autoRetry: Bool)
 }
 
 // Default empty implementations so integrators override only what they need.
@@ -393,6 +449,8 @@ public extension AppEngineDelegate {
     func appEngine(_ engine: AppEngine, audioRouteChanged route: AppAudioRoute?, available: [AppAudioRoute]) {}
     func appEngine(_ engine: AppEngine, videoCodecFallbackFrom from: String, to: String, reason: String) {}
     func appEngine(_ engine: AppEngine, tokenWillExpire token: String) {}
+    func appEngine(_ engine: AppEngine, fallbackStateChanged state: AppFallbackOption, isLocal: Bool) {}
+    func appEngine(_ engine: AppEngine, proxyStateChanged state: AppProxyState, autoRetry: Bool) {}
 }
 
 /// Main entry point of the AppLooma RTC SDK.
@@ -434,7 +492,9 @@ public final class AppEngine {
         self.appId = appId
         self.delegate = delegate
         self.options = options
-        self.room = Room(roomOptions: Self.roomOptions(options))
+        let device = DeviceConfigStore.current
+        self.activeDevice = device
+        self.room = Room(roomOptions: Self.roomOptions(options, device: device))
         self.room.add(delegate: self)
         Self.configureAudioSession(for: options.audioScenario)
         observeAudioRoute()
@@ -552,7 +612,20 @@ public final class AppEngine {
 
     /// The codec actually published, after `.auto` is resolved.
     public var publishedCodec: String {
-        codecOverride ?? configuredCodec
+        codecOverride ?? Self.deviceCodec(options.video.codec, resolved: configuredCodec, activeDevice)
+    }
+
+    /// Device tuning in effect for the current (or next) join.
+    private var activeDevice: DeviceVideoConfig
+
+    /// forceCodec always wins, preferCodec only replaces `.auto`; a codec the
+    /// server marks as hardware-denied falls back to the next safer one.
+    static func deviceCodec(_ app: AppVideoCodec, resolved: String, _ cfg: DeviceVideoConfig) -> String {
+        var c = resolved
+        if let f = cfg.forceCodec { c = f } else if app == .auto, let p = cfg.preferCodec { c = p }
+        if c == "h265" && cfg.denyHardware.contains("video/hevc") { c = "h264" }
+        if c == "h264" && cfg.denyHardware.contains("video/avc") { c = "vp8" }
+        return c
     }
 
     private var configuredCodec: String {
@@ -663,19 +736,24 @@ public final class AppEngine {
         }
     }
 
-    private static func roomOptions(_ o: AppEngineOptions, codecOverride: String? = nil, simulcastOverride: Bool? = nil) -> RoomOptions {
+    private static func roomOptions(_ o: AppEngineOptions, codecOverride: String? = nil, simulcastOverride: Bool? = nil,
+                                    device: DeviceVideoConfig = .empty, bitrateScale: Double = 1) -> RoomOptions {
         var mode = o.video.mode
         if mode == .ultraHd4k && !isUltraHdSupported() {
             print("[AppLoomaRTC] AppVideoMode.ultraHd4k is not supported on this device; using stableHd")
             mode = .stableHd
         }
-        let height = resolvedHeight(o.video)
+        var height = resolvedHeight(o.video)
+        // Device tuning only lowers caps, never raises them.
+        if device.maxHeight > 0 && height > device.maxHeight {
+            height = presetHeights.filter { $0 <= device.maxHeight }.max() ?? presetHeights[0]
+        }
         if o.video.height > 0 && height != o.video.height { print("[AppLoomaRTC] AppVideoConfig.height=\(o.video.height) is not a preset; using \(height)p") }
         if o.video.maxBitrate > 0 && o.video.maxBitrate < 10_000 {
             print("[AppLoomaRTC] AppVideoConfig.maxBitrate=\(o.video.maxBitrate) is in bits per second — did you mean \(o.video.maxBitrate)_000 (kbps)?")
         }
         // In .ultraHd4k, .auto prefers H.265 (hardware on every supported iPhone).
-        let codec = codecOverride ?? (o.video.codec == .auto && mode == .ultraHd4k ? "h265" : resolveCodec(o.video.codec))
+        let codec = codecOverride ?? deviceCodec(o.video.codec, resolved: o.video.codec == .auto && mode == .ultraHd4k ? "h265" : resolveCodec(o.video.codec), device)
         // Our own caps. `.adaptive` keeps the earlier sharp-end caps (the
         // preset defaults were tuned for calls and leave 1080p visibly soft);
         // 540p and below keep theirs. minBitrate: the engine's encoding
@@ -692,8 +770,12 @@ public final class AppEngine {
         case 2160: dimensions = Dimensions(width: 3840, height: 2160); defaultBitrate = codec == "h265" ? 16_000_000 : 25_000_000
         default: dimensions = .h1080_169; defaultBitrate = adaptive ? 4_000_000 : 3_500_000
         }
-        let encoding = VideoEncoding(maxBitrate: o.video.maxBitrate > 0 ? o.video.maxBitrate : defaultBitrate, maxFps: o.video.fps)
-        let simulcast = simulcastOverride ?? o.video.simulcast ?? adaptive
+        var maxBitrate = o.video.maxBitrate > 0 ? o.video.maxBitrate : defaultBitrate
+        if device.maxBitrateKbps > 0 { maxBitrate = min(maxBitrate, device.maxBitrateKbps * 1000) }
+        if bitrateScale < 1 { maxBitrate = max(300_000, Int(Double(maxBitrate) * bitrateScale)) }
+        let maxFps = device.maxFps > 0 ? min(o.video.fps, device.maxFps) : o.video.fps
+        let encoding = VideoEncoding(maxBitrate: maxBitrate, maxFps: maxFps)
+        let simulcast = (simulcastOverride ?? o.video.simulcast ?? adaptive) && !device.disableSimulcast
         let wantedDegradation: AppVideoDegradation = o.video.degradation == .auto && !adaptive ? .keepResolution : o.video.degradation
         let preferred: VideoCodec
         switch codec {
@@ -786,12 +868,19 @@ public final class AppEngine {
         reportedOutcomes.removeAll()
         diag.enabled = self.options.remoteDiagnostics
         diag.begin(token: token, region: self.options.region.rawValue)
+        // Device tuning: this join uses the cached answer; a fresh one is
+        // fetched in the background and applies to the next join. Never
+        // blocks the join.
+        activeDevice = DeviceConfigStore.current
+        DeviceConfigStore.refresh(token: token, region: self.options.region.rawValue)
+        resetFallbacks()
         diag.log("joinChannel region=\(self.options.region.rawValue) codec=\(publishedCodec) camera=\(options.camera) mic=\(options.microphone)")
         print("[AppLoomaRTC] joining (region: \(self.options.region.rawValue))")
         // Auto-subscribe so an audience member (and every co-host) receives all
         // published tracks the moment they join.
         do {
-            try await room.connect(url: wsUrl, token: token, connectOptions: ConnectOptions(autoSubscribe: true))
+            try await connectWithProxy(url: wsUrl, token: token,
+                                       roomOptions: Self.roomOptions(self.options, codecOverride: codecOverride, simulcastOverride: simulcastOverride, device: activeDevice))
         } catch {
             diag.log("join failed: \(error)")
             diag.problem("join_failed")
@@ -820,9 +909,11 @@ public final class AppEngine {
         diag.end("leave")
         stopStats()
         cancelTokenExpiry()
+        resetFallbacks()
         await room.disconnect()
         isJoined = false
         users.removeAll()
+        setProxyState(.direct, autoRetry: false)
     }
 
     /// Announces everyone already present, and their already-published tracks.
@@ -984,6 +1075,7 @@ public final class AppEngine {
                 self.diag.log("stats codec=\(self.publishedCodec) remotes=\(stats.count) minRemoteFps=\(minFps) freezes=\(freezes)")
             }
             for (uid, h) in self.health { self.checkUndecodable(uid: uid, health: h) }
+            self.applyFallbacks()
         }
     }
 
@@ -1071,9 +1163,15 @@ public final class AppEngine {
         diag.log("codec recovery: \(from) -> \(to) reason=\(reason)")
         diag.problem("fallback")
         reportDevice("fallback", codec: from, fromCodec: from, toCodec: "vp8")
-        let recovered = Self.roomOptions(options, codecOverride: codecOverride, simulcastOverride: simulcastOverride)
+        let recovered = Self.roomOptions(options, codecOverride: codecOverride, simulcastOverride: simulcastOverride, device: activeDevice)
+        guard await republishCamera(pub, with: recovered, what: "codec recovery") else { return }
+        Task { @MainActor in self.delegate?.appEngine(self, videoCodecFallbackFrom: from, to: to, reason: reason) }
+    }
+
+    /// Unpublishes the camera and publishes it again with `recovered`'s
+    /// capture and publish options, on the camera in use (front or back).
+    private func republishCamera(_ pub: LocalTrackPublication, with recovered: RoomOptions, what: String) async -> Bool {
         let publish = recovered.defaultVideoPublishOptions
-        // Come back on the camera in use (front or back), not the default one.
         let defaults = recovered.defaultCameraCaptureOptions
         let position = ((pub.track as? LocalVideoTrack)?.capturer as? CameraCapturer)?.position ?? defaults.position
         let capture = CameraCaptureOptions(position: position, dimensions: defaults.dimensions, fps: defaults.fps)
@@ -1081,12 +1179,305 @@ public final class AppEngine {
             try await room.localParticipant.unpublish(publication: pub)
             try await room.localParticipant.setCamera(enabled: true, captureOptions: capture, publishOptions: publish)
         } catch {
-            print("[AppLoomaRTC] codec recovery failed: \(error)")
-            diag.log("codec recovery failed: \(error)")
-            return
+            print("[AppLoomaRTC] \(what) failed: \(error)")
+            diag.log("\(what) failed: \(error)")
+            return false
         }
         notifyLocalVideoChanged()
-        Task { @MainActor in self.delegate?.appEngine(self, videoCodecFallbackFrom: from, to: to, reason: reason) }
+        return true
+    }
+
+    // MARK: - Cloud proxy
+
+    /// Current cloud proxy state (see `AppEngineOptions.cloudProxy`).
+    public private(set) var proxyState: AppProxyState = .direct
+    /// True while the AUTO retry tears down the failed direct attempt.
+    private var proxyRetrying = false
+
+    private func setProxyState(_ state: AppProxyState, autoRetry: Bool) {
+        guard state != proxyState else { return }
+        proxyState = state
+        diag.log("cloud proxy \(state)\(autoRetry ? " (auto retry)" : "")")
+        Task { @MainActor in self.delegate?.appEngine(self, proxyStateChanged: state, autoRetry: autoRetry) }
+    }
+
+    /// Whether a failed direct join is worth one retry through the relay: a
+    /// connection or network timeout, not a refused token.
+    static func isProxyRetryable(_ error: Error) -> Bool {
+        if error is CancellationError { return false }
+        let text = "\(error) \(error.localizedDescription)".lowercased()
+        let refused = ["401", "403", "unauthorized", "unauthorised", "forbidden", "permission", "invalid token",
+                       "token is expired", "not allowed", "already", "cancelled"]
+        if refused.contains(where: { text.contains($0) }) { return false }
+        let network = ["timedout", "timed out", "timeout", "network", "transport", " ice", "connection", "connect",
+                       "unreachable", "socket", "peer"]
+        return network.contains(where: { text.contains($0) })
+    }
+
+    /// Relay-only transport: media goes through the relay the server hands
+    /// out in its ICE servers (TLS on 443).
+    private static let relayConnectOptions = ConnectOptions(autoSubscribe: true, iceTransportPolicy: .relay)
+
+    private func connectWithProxy(url: String, token: String, roomOptions: RoomOptions) async throws {
+        let mode = options.cloudProxy
+        if mode == .forceTls443 {
+            setProxyState(.connecting, autoRetry: false)
+            do {
+                try await room.connect(url: url, token: token, connectOptions: Self.relayConnectOptions, roomOptions: roomOptions)
+            } catch {
+                setProxyState(.direct, autoRetry: false)
+                throw error
+            }
+            setProxyState(.connected, autoRetry: false)
+            return
+        }
+        do {
+            try await room.connect(url: url, token: token, connectOptions: ConnectOptions(autoSubscribe: true), roomOptions: roomOptions)
+        } catch {
+            guard mode == .auto, Self.isProxyRetryable(error) else { throw error }
+            diag.log("direct join failed; retrying once through the cloud proxy on TLS 443")
+            print("[AppLoomaRTC] Direct connection failed; retrying through the AppLooma cloud proxy (TLS 443)")
+            proxyRetrying = true
+            await room.disconnect()
+            proxyRetrying = false
+            setProxyState(.connecting, autoRetry: true)
+            do {
+                try await room.connect(url: url, token: token, connectOptions: Self.relayConnectOptions, roomOptions: roomOptions)
+            } catch {
+                setProxyState(.direct, autoRetry: true)
+                throw error
+            }
+            setProxyState(.connected, autoRetry: true)
+        }
+    }
+
+    // MARK: - Network fallback
+
+    private var subscribeFallback: AppFallbackOption = .none
+    private var publishFallback: AppFallbackOption = .none
+    private let downlinkPolicy = FallbackPolicy()
+    private let uplinkPolicy = FallbackPolicy()
+    /// Users whose video the subscribe fallback turned off (to turn back on).
+    private var fallbackHidden = Set<String>()
+    /// The publish fallback paused the camera and will turn it back on.
+    private var localFallbackMuted = false
+    /// The publish fallback republished the camera at a lower bitrate.
+    private var localFallbackLowered = false
+
+    /// What to give up on the video you receive when the network is poor for
+    /// about 4 s: `.videoLowQuality` asks for every remote camera's low layer
+    /// (only where the sender publishes layers and adaptive stream is off),
+    /// `.audioOnly` stops receiving remote video. Restored after about 10 s
+    /// of good network. Reported by `fallbackStateChanged` with isLocal
+    /// false. Default `.none`. On iOS the trigger is the media server's
+    /// quality estimate for this device.
+    public func setRemoteSubscribeFallback(_ option: AppFallbackOption) {
+        guard option != subscribeFallback else { return }
+        if downlinkPolicy.active { restoreSubscribe() }
+        downlinkPolicy.reset()
+        subscribeFallback = option
+    }
+
+    /// What to give up on the video you send when the network is poor for
+    /// about 4 s: `.videoLowQuality` republishes the camera at 30 % of its
+    /// bitrate (at least 300 kbps), `.audioOnly` pauses the camera. Restored
+    /// after about 10 s of good network. Reported by `fallbackStateChanged`
+    /// with isLocal true. Default `.none`.
+    public func setLocalPublishFallback(_ option: AppFallbackOption) {
+        guard option != publishFallback else { return }
+        if uplinkPolicy.active { Task { await self.restorePublish() } }
+        uplinkPolicy.reset()
+        publishFallback = option
+    }
+
+    private static func quality(_ q: ConnectionQuality) -> AppNetworkQuality {
+        switch q {
+        case .excellent: return .excellent
+        case .good: return .good
+        case .poor: return .poor
+        case .lost: return .lost
+        default: return .unknown
+        }
+    }
+
+    private func applyFallbacks() {
+        let q = Self.quality(room.localParticipant.connectionQuality)
+        let poor = q == .poor || q == .lost
+        let good = q == .excellent || q == .good
+        let now = Date()
+        if subscribeFallback != .none {
+            switch downlinkPolicy.onSample(now, poor: poor, good: good) {
+            case .some(true):
+                diag.log("fallback subscribe -> \(subscribeFallback)")
+                let state = subscribeFallback
+                Task { @MainActor in self.delegate?.appEngine(self, fallbackStateChanged: state, isLocal: false) }
+            case .some(false):
+                restoreSubscribe()
+                diag.log("fallback subscribe restored")
+                Task { @MainActor in self.delegate?.appEngine(self, fallbackStateChanged: .none, isLocal: false) }
+            case .none: break
+            }
+            // Re-applied each tick so users who join during a fallback are covered too.
+            if downlinkPolicy.active { applySubscribeFallback() }
+        }
+        if publishFallback != .none {
+            switch uplinkPolicy.onSample(now, poor: poor, good: good) {
+            case .some(true):
+                let state = publishFallback
+                Task {
+                    await self.applyPublishFallback()
+                    self.diag.log("fallback publish -> \(state)")
+                    await MainActor.run { self.delegate?.appEngine(self, fallbackStateChanged: state, isLocal: true) }
+                }
+            case .some(false):
+                Task {
+                    await self.restorePublish()
+                    self.diag.log("fallback publish restored")
+                    await MainActor.run { self.delegate?.appEngine(self, fallbackStateChanged: .none, isLocal: true) }
+                }
+            case .none: break
+            }
+        }
+    }
+
+    private func applySubscribeFallback() {
+        for (uid, user) in users {
+            for case let pub as RemoteTrackPublication in user.raw.videoTracks {
+                switch subscribeFallback {
+                case .audioOnly:
+                    if pub.isSubscribed {
+                        fallbackHidden.insert(uid)
+                        Task { try? await pub.set(subscribed: false) }
+                    }
+                case .videoLowQuality:
+                    Task { try? await pub.set(videoQuality: .low) }
+                case .none:
+                    break
+                }
+            }
+        }
+    }
+
+    private func restoreSubscribe() {
+        for (uid, user) in users {
+            for case let pub as RemoteTrackPublication in user.raw.videoTracks {
+                if fallbackHidden.contains(uid) && !pub.isSubscribed { Task { try? await pub.set(subscribed: true) } }
+                if subscribeFallback == .videoLowQuality { Task { try? await pub.set(videoQuality: .high) } }
+            }
+        }
+        fallbackHidden.removeAll()
+    }
+
+    private func cameraPublication() -> LocalTrackPublication? {
+        room.localParticipant.videoTracks.first(where: { $0.source == .camera }) as? LocalTrackPublication
+    }
+
+    private func applyPublishFallback() async {
+        guard let pub = cameraPublication(), pub.track != nil, !pub.isMuted else { return }
+        switch publishFallback {
+        case .audioOnly:
+            do {
+                try await room.localParticipant.setCamera(enabled: false)
+                localFallbackMuted = true
+                notifyLocalVideoChanged()
+            } catch {
+                diag.log("fallback publish failed: \(error)")
+            }
+        case .videoLowQuality:
+            let lowered = Self.roomOptions(options, codecOverride: codecOverride, simulcastOverride: simulcastOverride,
+                                           device: activeDevice, bitrateScale: 0.3)
+            localFallbackLowered = await republishCamera(pub, with: lowered, what: "fallback publish")
+        case .none:
+            break
+        }
+    }
+
+    private func restorePublish() async {
+        if localFallbackMuted && isJoined {
+            localFallbackMuted = false
+            do {
+                try await room.localParticipant.setCamera(enabled: true)
+                notifyLocalVideoChanged()
+            } catch {
+                diag.log("fallback restore failed: \(error)")
+            }
+        }
+        localFallbackMuted = false
+        if localFallbackLowered, isJoined, let pub = cameraPublication(), pub.track != nil {
+            let full = Self.roomOptions(options, codecOverride: codecOverride, simulcastOverride: simulcastOverride, device: activeDevice)
+            _ = await republishCamera(pub, with: full, what: "fallback restore")
+        }
+        localFallbackLowered = false
+    }
+
+    private func resetFallbacks() {
+        downlinkPolicy.reset()
+        uplinkPolicy.reset()
+        fallbackHidden.removeAll()
+        localFallbackMuted = false
+        localFallbackLowered = false
+    }
+
+    // MARK: - Pre-call network test
+
+    private var networkTestTask: Task<Void, Never>?
+
+    /// Test the network before a call: opens a short, separate connection
+    /// with `token` (mint it for a throwaway test channel, e.g.
+    /// "nettest-<uid>"; nothing is published), samples the media server's
+    /// quality estimate for about 5 s, leaves, and calls `completion` once on
+    /// the main thread. Gives up after 10 s with `error` set. Does not touch
+    /// the channel you are in. Honors `cloudProxy = .forceTls443`. Round-trip
+    /// time, jitter and loss are not measured on iOS yet (-1 / 0).
+    public func startNetworkTest(serverUrl: String, token: String, completion: @escaping (AppNetworkTestResult) -> Void) {
+        stopNetworkTest()
+        let connectOptions = options.cloudProxy == .forceTls443 ? Self.relayConnectOptions : ConnectOptions(autoSubscribe: false)
+        networkTestTask = Task { [weak self] in
+            let probe = Room()
+            let result: AppNetworkTestResult? = await withTaskGroup(of: AppNetworkTestResult?.self) { group in
+                group.addTask {
+                    do {
+                        try await probe.connect(url: serverUrl, token: token, connectOptions: connectOptions)
+                    } catch {
+                        return Task.isCancelled ? nil : AppEngine.failedTest("could not connect")
+                    }
+                    var qualities: [AppNetworkQuality] = []
+                    for _ in 0..<5 {
+                        try? await Task.sleep(nanoseconds: 1_000_000_000)
+                        if Task.isCancelled { return nil }
+                        qualities.append(AppEngine.quality(probe.localParticipant.connectionQuality))
+                    }
+                    // The worst reading of the window, so a spike is not hidden.
+                    let worst = qualities.filter { $0 != .unknown }.max(by: { $0.rawValue < $1.rawValue }) ?? .unknown
+                    return AppNetworkTestResult(uplinkQuality: worst, downlinkQuality: worst, rttMs: -1, jitterMs: -1,
+                                                uplinkLoss: 0, downlinkLoss: 0, error: nil)
+                }
+                group.addTask {
+                    try? await Task.sleep(nanoseconds: 10_000_000_000)
+                    return Task.isCancelled ? nil : AppEngine.failedTest("timed out")
+                }
+                let first = (await group.next()) ?? nil
+                group.cancelAll()
+                return first
+            }
+            await probe.disconnect()
+            guard !Task.isCancelled, let result else {
+                self?.diag.log("network test stopped")
+                return
+            }
+            await MainActor.run { completion(result) }
+        }
+    }
+
+    /// Stop a running `startNetworkTest`; its completion is not called.
+    public func stopNetworkTest() {
+        networkTestTask?.cancel()
+        networkTestTask = nil
+    }
+
+    private static func failedTest(_ error: String) -> AppNetworkTestResult {
+        AppNetworkTestResult(uplinkQuality: .unknown, downlinkQuality: .unknown, rttMs: -1, jitterMs: -1,
+                             uplinkLoss: 0, downlinkLoss: 0, error: error)
     }
 
     // MARK: - Token renewal
@@ -1234,7 +1625,7 @@ extension AppEngine: RoomDelegate {
         }
         diag.log("connection \(mapped)")
         if case .reconnecting = state { diag.reconnecting() }
-        if case .disconnected = state {
+        if case .disconnected = state, !proxyRetrying {
             diag.end("disconnected")
             isJoined = false
             stopStats()
@@ -1363,7 +1754,7 @@ enum DeviceReports {
     }
 
     /// Hardware identifier such as "iPhone15,2".
-    private static var model: String {
+    static var model: String {
         var info = utsname()
         uname(&info)
         let id = withUnsafeBytes(of: &info.machine) { raw in
@@ -1597,5 +1988,170 @@ final class DiagCollector {
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.httpBody = body
         URLSession.shared.dataTask(with: req) { _, response, _ in done(response != nil) }.resume()
+    }
+}
+
+
+// MARK: - Network fallback policy
+
+/// Hysteresis for one direction of network fallback: poor for `enter`
+/// seconds enters the fallback, good for `exit` seconds leaves it. Anything in
+/// between holds the current state and resets both timers.
+final class FallbackPolicy {
+    private let enter: TimeInterval
+    private let exit: TimeInterval
+    private(set) var active = false
+    private var poorSince: Date?
+    private var goodSince: Date?
+
+    init(enter: TimeInterval = 4, exit: TimeInterval = 10) {
+        self.enter = enter
+        self.exit = exit
+    }
+
+    /// The new state when it changed on this sample, nil otherwise.
+    func onSample(_ now: Date, poor: Bool, good: Bool) -> Bool? {
+        if poor {
+            goodSince = nil
+            let since = poorSince ?? now
+            poorSince = since
+            if !active && now.timeIntervalSince(since) >= enter { active = true; return true }
+        } else if good {
+            poorSince = nil
+            let since = goodSince ?? now
+            goodSince = since
+            if active && now.timeIntervalSince(since) >= exit { active = false; return false }
+        } else {
+            poorSince = nil
+            goodSince = nil
+        }
+        return nil
+    }
+
+    func reset() {
+        active = false
+        poorSince = nil
+        goodSince = nil
+    }
+}
+
+// MARK: - Device tuning
+
+/// Per-device video overrides decided by the AppLooma server (GET
+/// /v1/sdk/device-config). Every field is optional; `.empty` means "use the
+/// SDK defaults". Caps only lower what the app chose, never raise it.
+struct DeviceVideoConfig: Equatable {
+    var denyHardware: Set<String> = []
+    var forceCodec: String?
+    var preferCodec: String?
+    var maxHeight = 0
+    var maxFps = 0
+    var maxBitrateKbps = 0
+    var disableSimulcast = false
+    var ttlSeconds: TimeInterval = 3600
+
+    static let empty = DeviceVideoConfig()
+    private static let codecs: Set<String> = ["vp8", "h264", "h265"]
+    private static let mimes: Set<String> = ["video/avc", "video/hevc", "video/x-vnd.on2.vp8", "video/x-vnd.on2.vp9", "video/av01"]
+
+    /// Unknown or malformed fields are ignored; nil when the body is not a JSON object.
+    static func parse(_ data: Data?) -> DeviceVideoConfig? {
+        guard let data, let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+        var cfg = DeviceVideoConfig()
+        if let ttl = (root["ttlSeconds"] as? NSNumber)?.doubleValue, ttl > 0 { cfg.ttlSeconds = ttl }
+        guard let v = root["video"] as? [String: Any] else { return cfg }
+        func codec(_ key: String) -> String? {
+            guard let c = (v[key] as? String)?.lowercased(), codecs.contains(c) else { return nil }
+            return c
+        }
+        func positive(_ key: String) -> Int {
+            guard let n = (v[key] as? NSNumber)?.intValue, n > 0 else { return 0 }
+            return n
+        }
+        cfg.denyHardware = Set((v["denyHardware"] as? [Any] ?? []).compactMap { ($0 as? String)?.lowercased() }.filter { mimes.contains($0) })
+        cfg.forceCodec = codec("forceCodec")
+        cfg.preferCodec = codec("preferCodec")
+        cfg.maxHeight = positive("maxHeight")
+        cfg.maxFps = positive("maxFps")
+        cfg.maxBitrateKbps = positive("maxBitrateKbps")
+        cfg.disableSimulcast = (v["disableSimulcast"] as? Bool) == true
+        return cfg
+    }
+}
+
+/// The last good device-config answer, kept in UserDefaults with its ETag
+/// and ttl so a join never waits for the network. Process-wide; every error
+/// is swallowed and the call carries on with the SDK defaults.
+enum DeviceConfigStore {
+    private static let lock = NSLock()
+    private static var cached: DeviceVideoConfig?
+    private static var fetching = false
+    private static let defaults = UserDefaults.standard
+    private static let prefix = "applooma.devcfg."
+
+    private static var osVersion: String {
+        let v = ProcessInfo.processInfo.operatingSystemVersion
+        return "\(v.majorVersion).\(v.minorVersion).\(v.patchVersion)"
+    }
+
+    /// A cached answer is only valid for the same device, OS and SDK.
+    private static var key: String { "\(DeviceReports.model)|\(osVersion)|\(DeviceReports.sdkVersion)" }
+
+    static var current: DeviceVideoConfig {
+        lock.lock(); defer { lock.unlock() }
+        if let cached { return cached }
+        var cfg = DeviceVideoConfig.empty
+        if defaults.string(forKey: prefix + "key") == key, let parsed = DeviceVideoConfig.parse(defaults.data(forKey: prefix + "body")) {
+            cfg = parsed
+        }
+        cached = cfg
+        return cfg
+    }
+
+    /// Refreshes in the background when the cached answer is older than its ttl.
+    static func refresh(token: String, region: String) {
+        guard !token.isEmpty else { return }
+        let ttl = current.ttlSeconds
+        let sameKey = defaults.string(forKey: prefix + "key") == key
+        let at = defaults.double(forKey: prefix + "at")
+        let now = Date().timeIntervalSince1970
+        if sameKey && at > 0 && now - at >= 0 && now - at < ttl { return }
+        lock.lock()
+        if fetching { lock.unlock(); return }
+        fetching = true
+        lock.unlock()
+        var comps = URLComponents(string: "\(DeviceReports.apiBase)/sdk/device-config")
+        comps?.queryItems = [
+            URLQueryItem(name: "platform", value: "ios"),
+            URLQueryItem(name: "sdkVersion", value: DeviceReports.sdkVersion),
+            URLQueryItem(name: "manufacturer", value: "Apple"),
+            URLQueryItem(name: "model", value: DeviceReports.model),
+            URLQueryItem(name: "osVersion", value: osVersion),
+            URLQueryItem(name: "region", value: region),
+        ]
+        guard let url = comps?.url else { lock.lock(); fetching = false; lock.unlock(); return }
+        var req = URLRequest(url: url, timeoutInterval: 3)
+        req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        req.setValue("application/json", forHTTPHeaderField: "Accept")
+        if sameKey, let etag = defaults.string(forKey: prefix + "etag") { req.setValue(etag, forHTTPHeaderField: "If-None-Match") }
+        let cacheKey = key
+        URLSession.shared.dataTask(with: req) { data, response, _ in
+            DeviceConfigStore.store(data: data, response: response, cacheKey: cacheKey, now: now)
+        }.resume()
+    }
+
+    private static func store(data: Data?, response: URLResponse?, cacheKey: String, now: TimeInterval) {
+        defer { lock.lock(); fetching = false; lock.unlock() }
+        guard let http = response as? HTTPURLResponse else { return }
+        if http.statusCode == 304 {
+            defaults.set(now, forKey: prefix + "at")
+            return
+        }
+        guard http.statusCode == 200, let cfg = DeviceVideoConfig.parse(data) else { return }
+        defaults.set(cacheKey, forKey: prefix + "key")
+        defaults.set(data, forKey: prefix + "body")
+        defaults.set(http.value(forHTTPHeaderField: "ETag"), forKey: prefix + "etag")
+        defaults.set(now, forKey: prefix + "at")
+        lock.lock(); cached = cfg; lock.unlock()
     }
 }
