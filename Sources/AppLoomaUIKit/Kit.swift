@@ -224,10 +224,12 @@ class RoomModel: ObservableObject, AppEngineDelegate {
     nonisolated func appEngine(_ engine: AppEngine, activeSpeakersChanged uids: [String]) { Task { @MainActor in self.speaking = Set(uids) } }
     nonisolated func appEngine(_ engine: AppEngine, messageReceived message: AppMessage) { Task { @MainActor in self.message(message) } }
     nonisolated func appEngine(_ engine: AppEngine, remoteStats stats: [AppRemoteStats]) { Task { @MainActor in self.stats(stats) } }
+    nonisolated func appEngine(_ engine: AppEngine, videoQualityChanged quality: AppVideoQualityInfo) { Task { @MainActor in self.videoQuality(quality) } }
 
     func userJoined(_ user: AppRemoteUser) { tick += 1 }
     func userLeft(_ user: AppRemoteUser) { tick += 1 }
     func message(_ m: AppMessage) {}
     func stats(_ s: [AppRemoteStats]) {}
+    func videoQuality(_ q: AppVideoQualityInfo) {}
 }
 #endif

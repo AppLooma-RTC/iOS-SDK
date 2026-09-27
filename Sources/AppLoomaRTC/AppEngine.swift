@@ -98,31 +98,60 @@ public struct AppVideoQualityInfo: Sendable {
     public let reason: AppVideoQualityReason
 }
 
+/// How the SDK tunes your camera when you leave the details to it.
+///
+/// `.stableHd` (default) holds one steady HD picture: a single layer,
+/// resolution kept under pressure (frame rate gives way first) and receivers
+/// pinned to the full picture. 1080p30 at 3.5 Mbps (every iPhone encodes in
+/// hardware).
+///
+/// `.ultraHd4k` is the premium mode: 2160p30, one layer, resolution kept,
+/// H.265 at 16 Mbps. Both ends need a strong network (20 Mbps or more each way
+/// recommended) and the phone runs warmer. See `AppEngine.isUltraHdSupported()`.
+///
+/// `.adaptive` is the earlier behaviour: three layers, receivers switch layers
+/// by view size and network, resolution may drop to keep motion smooth.
+///
+/// Any field you set explicitly on `AppVideoConfig` wins over the mode.
+public enum AppVideoMode: Sendable {
+    case stableHd, ultraHd4k, adaptive
+}
+
 /// Capture and encode settings for your own camera.
+///
+/// `mode` picks sensible values for everything below; see `AppVideoMode`.
+/// Fields left at their default follow the mode, fields you set win.
 ///
 /// `maxBitrate` is in **bits per second** — `1_900_000` for 1.9 Mbps. A value
 /// under 10 000 is almost certainly kbps by mistake and is logged as a warning.
-/// `height` must be one of 360 / 540 / 720 / 1080; anything else snaps to the
-/// nearest preset (also logged).
+/// `height` must be one of 360 / 540 / 720 / 1080 / 1440 / 2160; anything else
+/// snaps to the nearest preset (also logged). 0 = chosen by the mode.
 public struct AppVideoConfig: Sendable {
-    /// 360, 540, 720, 1080 or 1440 — the short edge of a 16:9 frame.
+    /// 360, 540, 720, 1080, 1440 or 2160 — the short edge of a 16:9 frame. 0 = chosen by `mode`.
     public var height: Int
     public var fps: Int
-    /// Cap on the encoder's bitrate in bits per second; 0 = our default for the
-    /// height (5 Mbps at 1440p, 4 Mbps at 1080p, 2.2 Mbps at 720p, the preset
-    /// default below that).
+    /// Cap on the encoder's bitrate in bits per second; 0 = chosen by `mode`
+    /// (3.5 Mbps at 1080p for `.stableHd`, 16 Mbps H.265 / 25 Mbps otherwise
+    /// for `.ultraHd4k`; in `.adaptive` 5 Mbps at 1440p, 4 Mbps at 1080p,
+    /// 2.2 Mbps at 720p, the preset default below that).
     public var maxBitrate: Int
-    public var simulcast: Bool
+    /// Three layers so weak links still get a picture; false = one layer only.
+    /// nil = chosen by `mode` (on in `.adaptive`, off otherwise).
+    public var simulcast: Bool?
     public var codec: AppVideoCodec
     /// What to give up first under pressure. See `AppVideoDegradation`.
+    /// `.auto` = chosen by `mode` (`.keepResolution` in `.stableHd` and `.ultraHd4k`).
     public var degradation: AppVideoDegradation
+    /// The overall tuning; see `AppVideoMode`.
+    public var mode: AppVideoMode
     /// Floor on the encoder's bitrate in bits per second; 0 = engine default.
     /// Reserved: the engine exposes no per-sender minimum on iOS today, so the
     /// value is kept but does not change what is sent.
     public var minBitrate: Int
 
-    public init(height: Int = 1080, fps: Int = 30, maxBitrate: Int = 0, simulcast: Bool = true, codec: AppVideoCodec = .auto,
-                degradation: AppVideoDegradation = .auto, minBitrate: Int = 0) {
+    public init(height: Int = 0, fps: Int = 30, maxBitrate: Int = 0, simulcast: Bool? = nil, codec: AppVideoCodec = .auto,
+                degradation: AppVideoDegradation = .auto, minBitrate: Int = 0, mode: AppVideoMode = .stableHd) {
+        self.mode = mode
         self.height = height
         self.fps = fps
         self.maxBitrate = maxBitrate
@@ -482,7 +511,9 @@ public final class AppEngine {
     }
 
     /// The codec actually published, after `.auto` is resolved.
-    public var publishedCodec: String { Self.resolveCodec(options.video.codec) }
+    public var publishedCodec: String {
+        options.video.codec == .auto && options.video.mode == .ultraHd4k && Self.isUltraHdSupported() ? "h265" : Self.resolveCodec(options.video.codec)
+    }
 
     // Own-camera quality, folded from sender statistics; reported on change only.
     private var lastQuality: AppVideoQualityInfo?
@@ -515,7 +546,7 @@ public final class AppEngine {
         let active = streams.filter { ($0.framesPerSecond ?? 0) > 0 && ($0.frameHeight ?? 0) > 0 }
         guard let top = active.max(by: { ($0.frameHeight ?? 0) < ($1.frameHeight ?? 0) }) else { return }
         let h = Int(top.frameHeight ?? 0)
-        let configured = Self.snapHeight(options.video.height)
+        let configured = Self.resolvedHeight(options.video)
         let layer: AppVideoLayer
         switch top.rid {
         case "f": layer = .high
@@ -558,7 +589,21 @@ public final class AppEngine {
         }
     }
 
-    static let presetHeights = [360, 540, 720, 1080, 1440]
+    static let presetHeights = [360, 540, 720, 1080, 1440, 2160]
+
+    /// Whether this device can publish `AppVideoMode.ultraHd4k`. Not gated on
+    /// iOS: every iPhone the SDK supports (A12 and later) encodes 2160p30 in
+    /// hardware, so this returns true.
+    public static func isUltraHdSupported() -> Bool { true }
+
+    /// The height `c` captures at once the mode fills in the blanks.
+    static func resolvedHeight(_ c: AppVideoConfig) -> Int {
+        if c.height > 0 { return snapHeight(c.height) }
+        switch c.mode {
+        case .ultraHd4k: return isUltraHdSupported() ? 2160 : 1080
+        case .stableHd, .adaptive: return 1080
+        }
+    }
 
     static func snapHeight(_ wanted: Int) -> Int {
         presetHeights.min(by: { abs($0 - wanted) < abs($1 - wanted) }) ?? 1080
@@ -575,26 +620,37 @@ public final class AppEngine {
     }
 
     private static func roomOptions(_ o: AppEngineOptions) -> RoomOptions {
-        let height = snapHeight(o.video.height)
-        if height != o.video.height { print("[AppLoomaRTC] AppVideoConfig.height=\(o.video.height) is not a preset; using \(height)p") }
+        var mode = o.video.mode
+        if mode == .ultraHd4k && !isUltraHdSupported() {
+            print("[AppLoomaRTC] AppVideoMode.ultraHd4k is not supported on this device; using stableHd")
+            mode = .stableHd
+        }
+        let height = resolvedHeight(o.video)
+        if o.video.height > 0 && height != o.video.height { print("[AppLoomaRTC] AppVideoConfig.height=\(o.video.height) is not a preset; using \(height)p") }
         if o.video.maxBitrate > 0 && o.video.maxBitrate < 10_000 {
             print("[AppLoomaRTC] AppVideoConfig.maxBitrate=\(o.video.maxBitrate) is in bits per second — did you mean \(o.video.maxBitrate)_000 (kbps)?")
         }
-        // Our own caps for the sharp end: the preset defaults were tuned for
-        // calls and leave 1080p visibly soft on a good link. 540p and below
-        // keep theirs. minBitrate: the engine's encoding carries no floor on
-        // iOS, so AppVideoConfig.minBitrate is not applied here.
+        // In .ultraHd4k, .auto prefers H.265 (hardware on every supported iPhone).
+        let codec = o.video.codec == .auto && mode == .ultraHd4k ? "h265" : resolveCodec(o.video.codec)
+        // Our own caps. `.adaptive` keeps the earlier sharp-end caps (the
+        // preset defaults were tuned for calls and leave 1080p visibly soft);
+        // 540p and below keep theirs. minBitrate: the engine's encoding
+        // carries no floor on iOS, so AppVideoConfig.minBitrate is not applied
+        // here. No start-bitrate hook is exposed either.
+        let adaptive = mode == .adaptive
         let dimensions: Dimensions
         let defaultBitrate: Int
         switch height {
         case 360: dimensions = .h360_169; defaultBitrate = 400_000
         case 540: dimensions = .h540_169; defaultBitrate = 800_000
-        case 720: dimensions = .h720_169; defaultBitrate = 2_200_000
+        case 720: dimensions = .h720_169; defaultBitrate = adaptive ? 2_200_000 : 1_800_000
         case 1440: dimensions = .h1440_169; defaultBitrate = 5_000_000
-        default: dimensions = .h1080_169; defaultBitrate = 4_000_000
+        case 2160: dimensions = Dimensions(width: 3840, height: 2160); defaultBitrate = codec == "h265" ? 16_000_000 : 25_000_000
+        default: dimensions = .h1080_169; defaultBitrate = adaptive ? 4_000_000 : 3_500_000
         }
         let encoding = VideoEncoding(maxBitrate: o.video.maxBitrate > 0 ? o.video.maxBitrate : defaultBitrate, maxFps: o.video.fps)
-        let codec = resolveCodec(o.video.codec)
+        let simulcast = o.video.simulcast ?? adaptive
+        let wantedDegradation: AppVideoDegradation = o.video.degradation == .auto && !adaptive ? .keepResolution : o.video.degradation
         let preferred: VideoCodec
         switch codec {
         case "h264": preferred = .h264
@@ -610,24 +666,26 @@ public final class AppEngine {
             ),
             defaultVideoPublishOptions: VideoPublishOptions(
                 encoding: encoding,
-                simulcast: o.video.simulcast,
+                simulcast: simulcast,
                 preferredCodec: preferred,
                 // Anything but VP8 rides with a VP8 backup layer so a viewer
                 // whose device cannot decode it is served VP8 by the server
                 // instead of a black frame.
                 preferredBackupCodec: codec == "vp8" ? nil : .vp8,
-                degradationPreference: degradation(o.video.degradation)
+                degradationPreference: degradation(wantedDegradation)
             ),
             defaultAudioPublishOptions: AudioPublishOptions(
                 encoding: AudioEncoding(maxBitrate: 96_000),
                 dtx: false,
                 red: true
             ),
-            // Adaptive stream still down-shifts a remote layer for a small or
-            // hidden view. Dynacast is OFF: with it on, a publisher withholds a
-            // video layer until a subscriber's "viewing" signal arrives, which on
-            // flaky links left co-hosts staring at a black frame.
-            adaptiveStream: true,
+            // `.adaptive`: adaptive stream down-shifts a remote layer for a
+            // small or hidden view. `.stableHd` / `.ultraHd4k` turn it off so a
+            // receiver keeps the full picture. Dynacast is OFF: with it on, a
+            // publisher withholds a video layer until a subscriber's "viewing"
+            // signal arrives, which on flaky links left co-hosts staring at a
+            // black frame.
+            adaptiveStream: adaptive,
             dynacast: false,
             reportRemoteTrackStatistics: true
         )

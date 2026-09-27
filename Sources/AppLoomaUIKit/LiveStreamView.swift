@@ -69,7 +69,7 @@ public struct AppLoomaLiveStreamView: View {
 
     /// - Parameter role: `.host` goes live straight away, `.audience` watches. Nil lets the user choose.
     public init(kit: AppLoomaKit, room: String, role: KitLiveRole? = nil, onLeave: @escaping () -> Void = {}) {
-        _m = StateObject(wrappedValue: LiveModel(kit: kit, room: room, options: AppEngineOptions(audioScenario: .media, video: AppVideoConfig(height: 720, fps: 30))))
+        _m = StateObject(wrappedValue: LiveModel(kit: kit, room: room, options: AppEngineOptions(audioScenario: .media, video: AppVideoConfig(fps: 30))))
         fixedRole = role
         self.onLeave = onLeave
     }

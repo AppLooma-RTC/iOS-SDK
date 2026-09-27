@@ -17,7 +17,7 @@ final class CallModel: RoomModel {
     init(kit: AppLoomaKit, room: String, video: Bool) {
         self.video = video
         // A private voice call belongs on the call path: earpiece, speech-tuned echo cancelling.
-        super.init(kit: kit, room: room, options: AppEngineOptions(audioScenario: video ? .media : .call, video: AppVideoConfig(height: 720, fps: 30)))
+        super.init(kit: kit, room: room, options: AppEngineOptions(audioScenario: video ? .media : .call, video: AppVideoConfig(fps: 30)))
     }
 
     func start() {
@@ -47,7 +47,14 @@ final class CallModel: RoomModel {
     }
     override func stats(_ s: [AppRemoteStats]) {
         guard let x = s.first else { return }
-        quality = video && x.videoHeight > 0 ? "\(x.videoHeight)p" : (x.audioPacketsLost > 50 ? "Weak" : "HD")
+        // Never a pixel count: "HD" normally, "Weak network" only after five
+        // seconds of a bandwidth-limited camera or heavy audio loss.
+        let limited = bandwidthSince.map { Date().timeIntervalSince($0) >= 5 } ?? false
+        quality = limited || x.audioPacketsLost > 50 ? "Weak network" : "HD"
+    }
+    private var bandwidthSince: Date?
+    override func videoQuality(_ q: AppVideoQualityInfo) {
+        bandwidthSince = q.reason == .bandwidth ? (bandwidthSince ?? Date()) : nil
     }
 }
 
