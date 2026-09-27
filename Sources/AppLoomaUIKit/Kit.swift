@@ -103,22 +103,41 @@ struct RoundButton: View {
     var brand = false
     var tint: Color = .white
     var label: String?
+    var accessibility: String?
     let action: () -> Void
+    private var circle: some View {
+        Button(action: action) {
+            ZStack {
+                if off { Circle().fill(Color.white) }
+                else if danger { Circle().fill(K.live).shadow(color: K.live.opacity(0.45), radius: 12, y: 8) }
+                else if brand { Circle().fill(K.brand) }
+                else { Circle().fill(K.glass2) }
+                Image(systemName: icon).font(.system(size: size * 0.38, weight: .semibold))
+                    .foregroundColor(off ? Color(white: 0.07) : tint)
+            }
+            .frame(width: size, height: size)
+        }
+        .buttonStyle(.plain)
+    }
     var body: some View {
         VStack(spacing: 7) {
-            Button(action: action) {
-                ZStack {
-                    if off { Circle().fill(Color.white) }
-                    else if danger { Circle().fill(K.live).shadow(color: K.live.opacity(0.45), radius: 12, y: 8) }
-                    else if brand { Circle().fill(K.brand) }
-                    else { Circle().fill(K.glass2) }
-                    Image(systemName: icon).font(.system(size: size * 0.38, weight: .semibold))
-                        .foregroundColor(off ? Color(white: 0.07) : tint)
-                }
-                .frame(width: size, height: size)
-            }
-            .buttonStyle(.plain)
+            if let accessibility { circle.accessibilityLabel(Text(accessibility)) } else { circle }
             if let label { Text(label).font(.system(size: 11.5)).foregroundColor(Color(white: 0.82)) }
+        }
+    }
+}
+
+/// Loudspeaker on/off. While a Bluetooth or wired headset carries the audio the
+/// button shows headphones and does nothing — the headset keeps priority.
+struct SpeakerButton: View {
+    @ObservedObject var model: RoomModel
+    var label: String?
+    var body: some View {
+        if model.headsetInUse {
+            RoundButton(icon: "headphones", label: label, accessibility: "Headset in use") {}
+        } else {
+            RoundButton(icon: model.speaker ? "speaker.wave.2.fill" : "speaker.slash.fill", off: !model.speaker, label: label,
+                        accessibility: model.speaker ? "Loudspeaker on" : "Loudspeaker off") { model.toggleSpeaker() }
         }
     }
 }
@@ -190,10 +209,15 @@ class RoomModel: ObservableObject, AppEngineDelegate {
     @Published var tick = 0
     @Published var chat: [ChatLine] = []
     @Published var speaking: Set<String> = []
+    /// Loudspeaker (true) or earpiece (false); starts from the screen's scenario.
+    @Published var speaker: Bool
+    @Published var audioRoute: AppAudioRoute?
+    var headsetInUse: Bool { audioRoute == .bluetooth || audioRoute == .wiredHeadset }
 
     init(kit: AppLoomaKit, room: String, options: AppEngineOptions) {
         self.kit = kit
         self.room = room
+        self.speaker = options.audioScenario != .call
         self.engine = AppEngine.create(appId: kit.appId, options: options)
         self.engine.delegate = self
     }
@@ -206,6 +230,7 @@ class RoomModel: ObservableObject, AppEngineDelegate {
     func join(role: String, appRole: AppRole, camera: Bool, microphone: Bool) async throws {
         let t = try await kit.tokenProvider(room, role, kit.user)
         try await engine.joinChannel(token: t.token, wsUrl: t.wsUrl, options: AppJoinOptions(role: appRole, camera: camera, microphone: microphone))
+        routeChanged(engine.currentAudioRoute)
         tick += 1
     }
 
@@ -214,6 +239,19 @@ class RoomModel: ObservableObject, AppEngineDelegate {
     }
 
     func leave() { Task { await engine.leaveChannel() } }
+
+    /// Flip between loudspeaker and earpiece. A no-op while a headset is in
+    /// use, and on devices without an earpiece (the route stays on the speaker).
+    func toggleSpeaker() {
+        guard !headsetInUse else { return }
+        let want = !speaker
+        if engine.setAudioRoute(want ? .speaker : .earpiece) { speaker = want }
+    }
+
+    func routeChanged(_ route: AppAudioRoute?) {
+        audioRoute = route
+        if route == .speaker { speaker = true } else if route == .earpiece { speaker = false }
+    }
 
     // Default delegate plumbing: any change re-renders.
     nonisolated func appEngine(_ engine: AppEngine, userJoined user: AppRemoteUser) { Task { @MainActor in self.userJoined(user) } }
@@ -224,6 +262,7 @@ class RoomModel: ObservableObject, AppEngineDelegate {
     nonisolated func appEngine(_ engine: AppEngine, activeSpeakersChanged uids: [String]) { Task { @MainActor in self.speaking = Set(uids) } }
     nonisolated func appEngine(_ engine: AppEngine, messageReceived message: AppMessage) { Task { @MainActor in self.message(message) } }
     nonisolated func appEngine(_ engine: AppEngine, remoteStats stats: [AppRemoteStats]) { Task { @MainActor in self.stats(stats) } }
+    nonisolated func appEngine(_ engine: AppEngine, audioRouteChanged route: AppAudioRoute?, available: [AppAudioRoute]) { Task { @MainActor in self.routeChanged(route) } }
     nonisolated func appEngine(_ engine: AppEngine, videoQualityChanged quality: AppVideoQualityInfo) { Task { @MainActor in self.videoQuality(quality) } }
 
     func userJoined(_ user: AppRemoteUser) { tick += 1 }

@@ -171,6 +171,7 @@ public struct AppLoomaLiveStreamView: View {
             TextField("Say something…", text: $say, onCommit: sendText)
                 .foregroundColor(K.text).padding(.horizontal, 18).frame(height: 46)
                 .background(Capsule().fill(Color.black.opacity(0.35))).overlay(Capsule().stroke(K.line))
+            SpeakerButton(model: m)
             RoundButton(icon: "gift.fill", tint: K.gold) { let i = Int.random(in: 0..<gifts.count); m.gift(from: m.kit.user.name, index: i); m.send(data: ["kind": "gift", "i": i]) }
             RoundButton(icon: "heart.fill", brand: true) { m.heart(); m.send(data: ["kind": "like"], reliable: false) }
         }

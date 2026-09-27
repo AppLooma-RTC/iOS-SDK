@@ -121,6 +121,7 @@ public struct AppLoomaVoiceRoomView: View {
                         .foregroundColor(K.text).padding(.horizontal, 18).frame(height: 46)
                         .background(Capsule().fill(Color.black.opacity(0.35))).overlay(Capsule().stroke(K.line))
                     RoundButton(icon: m.mic ? "mic.fill" : "mic.slash.fill", off: !m.mic) { m.mic.toggle(); let on = m.mic; Task { try? await m.engine.enableMicrophone(on) } }
+                    SpeakerButton(model: m)
                     RoundButton(icon: "hand.wave") { m.add(ChatLine(who: m.kit.user.name, text: "waved 👋", system: true)); m.send(data: ["kind": "wave"]) }
                 }.padding(12)
             }

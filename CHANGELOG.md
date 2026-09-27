@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.5.3
+
+- UIKit: loudspeaker button on the live stream (host and viewer), voice room and call screens. Speaker icon when on, speaker-off when on the earpiece; while a Bluetooth or wired headset carries the audio it shows headphones, does nothing and reads "Headset in use". VoiceOver labels "Loudspeaker on"/"Loudspeaker off". Starts on the loudspeaker for live, voice rooms and video calls, on the earpiece for voice calls (iPad stays on the loudspeaker).
+
 ## 0.5.2
 
 - `AppVideoMode` on `AppVideoConfig.mode`: `.stableHd` (new default), `.ultraHd4k` (premium, opt-in), `.adaptive` (the previous behaviour). `.stableHd` publishes one 1080p30 layer at 3.5 Mbps (no simulcast), keeps resolution under pressure and turns adaptive stream off so receivers keep the full picture.

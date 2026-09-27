@@ -116,6 +116,8 @@ public struct AppLoomaCallView: View {
                         RoundButton(icon: m.cam ? "video.fill" : "video.slash.fill", off: !m.cam, label: "Camera") { m.cam.toggle(); let on = m.cam; Task { try? await m.engine.enableCamera(on) } }
                         Spacer()
                     }
+                    SpeakerButton(model: m, label: "Speaker")
+                    Spacer()
                     RoundButton(icon: "phone.down.fill", size: 66, danger: true, label: "End", action: onLeave)
                     Spacer()
                     if m.video {
