@@ -191,13 +191,21 @@ public struct AppEngineOptions: Sendable {
     public var audio: AppAudioOptions
     /// Preferred server region; `.auto` by default. See `AppRegion`.
     public var region: AppRegion
+    /// Remote diagnostics, default true. The SDK keeps its own recent log
+    /// lines and a stats snapshot every 10 s in memory (never audio, video,
+    /// messages or names) and uploads them, scrubbed, after a call that had a
+    /// problem, when AppLooma support switched collection on for this device
+    /// or project, or when you call `uploadDiagnostics(reason:)`. Kept 14
+    /// days. `false` turns every upload off.
+    public var remoteDiagnostics: Bool
 
     public init(audioScenario: AppAudioScenario = .call, video: AppVideoConfig = AppVideoConfig(), audio: AppAudioOptions = AppAudioOptions(),
-                region: AppRegion = .auto) {
+                region: AppRegion = .auto, remoteDiagnostics: Bool = true) {
         self.audioScenario = audioScenario
         self.video = video
         self.audio = audio
         self.region = region
+        self.remoteDiagnostics = remoteDiagnostics
     }
 }
 
@@ -413,6 +421,9 @@ public final class AppEngine {
     private var trackOwner: [String: String] = [:] // track sid -> uid
     private var statsTimer: Timer?
     private var joinStartedAt: Date?
+    /// Remote diagnostics ring and uploader (see `uploadDiagnostics(reason:)`).
+    let diag = DiagCollector()
+    private var lastDiagStatsAt = Date.distantPast
 
     #if canImport(UIKit)
     // Self-views; re-bound on every local track change.
@@ -773,11 +784,22 @@ public final class AppEngine {
         viewerReports.removeAll()
         joinToken = token
         reportedOutcomes.removeAll()
+        diag.enabled = self.options.remoteDiagnostics
+        diag.begin(token: token, region: self.options.region.rawValue)
+        diag.log("joinChannel region=\(self.options.region.rawValue) codec=\(publishedCodec) camera=\(options.camera) mic=\(options.microphone)")
         print("[AppLoomaRTC] joining (region: \(self.options.region.rawValue))")
         // Auto-subscribe so an audience member (and every co-host) receives all
         // published tracks the moment they join.
-        try await room.connect(url: wsUrl, token: token, connectOptions: ConnectOptions(autoSubscribe: true))
+        do {
+            try await room.connect(url: wsUrl, token: token, connectOptions: ConnectOptions(autoSubscribe: true))
+        } catch {
+            diag.log("join failed: \(error)")
+            diag.problem("join_failed")
+            diag.end("join failed")
+            throw error
+        }
         isJoined = true
+        diag.log("connected in \(elapsedMs()) ms")
         let ms = elapsedMs()
         Task { @MainActor in self.delegate?.appEngine(self, connectionStage: .connected, uid: nil, elapsedMs: ms) }
 
@@ -795,6 +817,7 @@ public final class AppEngine {
     }
 
     public func leaveChannel() async {
+        diag.end("leave")
         stopStats()
         cancelTokenExpiry()
         await room.disconnect()
@@ -954,6 +977,12 @@ public final class AppEngine {
                                audioPacketsLost: h.aLost, audioJitterMs: h.jitterMs)
             }
             if !stats.isEmpty { self.delegate?.appEngine(self, remoteStats: stats) }
+            if Date().timeIntervalSince(self.lastDiagStatsAt) >= 10 {
+                self.lastDiagStatsAt = Date()
+                let minFps = stats.map { $0.videoFps }.min() ?? -1
+                let freezes = stats.reduce(0) { $0 + $1.videoFreezeCount }
+                self.diag.log("stats codec=\(self.publishedCodec) remotes=\(stats.count) minRemoteFps=\(minFps) freezes=\(freezes)")
+            }
             for (uid, h) in self.health { self.checkUndecodable(uid: uid, health: h) }
         }
     }
@@ -1014,6 +1043,8 @@ public final class AppEngine {
         viewerReports[viewer] = now
         viewerReports = viewerReports.filter { now.timeIntervalSince($0.value) <= 20 }
         reportDevice("viewers_cannot_decode", codec: publishedCodec)
+        diag.log("viewer uid=\(viewer) reports no picture codec=\(publishedCodec)")
+        diag.problem("no_frames")
         // Two distinct viewers within 20 s, or the only other person in a 1:1.
         if viewerReports.count >= 2 || room.remoteParticipants.count <= 1 {
             Task { await self.fallBack(reason: "viewers_cannot_decode") }
@@ -1037,6 +1068,8 @@ public final class AppEngine {
             to = "vp8:single"
         }
         print("[AppLoomaRTC] codec recovery: \(from) -> \(to) (\(reason))")
+        diag.log("codec recovery: \(from) -> \(to) reason=\(reason)")
+        diag.problem("fallback")
         reportDevice("fallback", codec: from, fromCodec: from, toCodec: "vp8")
         let recovered = Self.roomOptions(options, codecOverride: codecOverride, simulcastOverride: simulcastOverride)
         let publish = recovered.defaultVideoPublishOptions
@@ -1049,6 +1082,7 @@ public final class AppEngine {
             try await room.localParticipant.setCamera(enabled: true, captureOptions: capture, publishOptions: publish)
         } catch {
             print("[AppLoomaRTC] codec recovery failed: \(error)")
+            diag.log("codec recovery failed: \(error)")
             return
         }
         notifyLocalVideoChanged()
@@ -1065,7 +1099,19 @@ public final class AppEngine {
     /// not interrupted. Stored even when not joined.
     public func renewToken(_ token: String) {
         joinToken = token
+        diag.updateToken(token)
+        diag.log("join token renewed")
         if isJoined { armTokenExpiry() }
+    }
+
+    /// Upload this device's recent SDK log lines to AppLooma support now (or
+    /// with the next join when not in a channel), for example from a "report
+    /// a problem" button. `reason` is a short label you choose. Only
+    /// SDK-produced lines are sent, scrubbed of names, metadata, tokens and
+    /// URL parameters; never audio, video or messages. Does nothing when
+    /// `AppEngineOptions.remoteDiagnostics` is false.
+    public func uploadDiagnostics(reason: String) {
+        diag.request(reason)
     }
 
     /// `exp` (seconds since 1970) from a JWT's payload, decoded locally.
@@ -1186,7 +1232,10 @@ extension AppEngine: RoomDelegate {
         case .reconnecting: mapped = .reconnecting
         default: mapped = .disconnected
         }
+        diag.log("connection \(mapped)")
+        if case .reconnecting = state { diag.reconnecting() }
         if case .disconnected = state {
+            diag.end("disconnected")
             isJoined = false
             stopStats()
             cancelTokenExpiry()
@@ -1346,5 +1395,207 @@ enum DeviceReports {
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.httpBody = body
         URLSession.shared.dataTask(with: req) { _, _, _ in }.resume()
+    }
+}
+
+
+// MARK: - Remote diagnostics
+
+/// SDK log lines kept in memory (a fixed ring, nothing formatted on add) and
+/// uploaded, scrubbed, to POST /v1/sdk/diag after a call with a problem, when
+/// the device config asks for it, or on `uploadDiagnostics(reason:)`. Plain
+/// JSON; a failed upload is kept in memory for the next join. Every error is
+/// swallowed.
+final class DiagCollector {
+    private let lock = NSLock()
+    private let capacity = 600
+    private var times: [Date] = []
+    private var lines: [String] = []
+    private var next = 0
+    var enabled = true
+    private var remoteEnabled = false
+    private var token: String?
+    private var region = "auto"
+    private var active = false
+    private var problems = Set<String>()
+    private var reconnects = 0
+    private var appReason: String?
+    private var uploaded = false
+    private var midCall: Timer?
+    private var pending: Data?
+
+    func log(_ line: String) {
+        lock.lock(); defer { lock.unlock() }
+        if lines.count < capacity {
+            times.append(Date()); lines.append(line)
+        } else {
+            times[next] = Date(); lines[next] = line
+            next = (next + 1) % capacity
+        }
+    }
+
+    func problem(_ kind: String) {
+        lock.lock(); problems.insert(kind); lock.unlock()
+        log("diag: problem \(kind)")
+    }
+
+    func reconnecting() { lock.lock(); reconnects += 1; lock.unlock() }
+
+    func updateToken(_ t: String) { lock.lock(); if active { token = t }; lock.unlock() }
+
+    func begin(token: String, region: String) {
+        lock.lock()
+        self.token = token
+        self.region = region
+        active = true
+        uploaded = false
+        reconnects = 0
+        let isOn = enabled
+        let saved = pending
+        lock.unlock()
+        guard isOn else { return }
+        if let saved { post(token: token, body: saved) { [weak self] ok in if ok { self?.lock.lock(); self?.pending = nil; self?.lock.unlock() } } }
+        fetchRemoteFlag(token: token)
+        midCall?.invalidate()
+        let timer = Timer(timeInterval: 60, repeats: false) { [weak self] _ in self?.maybeUpload(final: false, force: false) }
+        RunLoop.main.add(timer, forMode: .common)
+        midCall = timer
+    }
+
+    func end(_ why: String) {
+        lock.lock()
+        let wasActive = active
+        active = false
+        lock.unlock()
+        guard wasActive else { return }
+        log("diag: session end (\(why))")
+        midCall?.invalidate()
+        midCall = nil
+        maybeUpload(final: true, force: false)
+    }
+
+    func request(_ reason: String) {
+        let clean = Self.clean(reason, 64)
+        lock.lock(); appReason = clean; let isActive = active; lock.unlock()
+        log("diag: app requested upload")
+        if isActive { maybeUpload(final: false, force: true) }
+    }
+
+    /// Server-accepted characters only.
+    static func clean(_ s: String, _ max: Int) -> String {
+        let allowed = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 ._-+/(),:#")
+        let mapped = String(s.unicodeScalars.map { allowed.contains($0) ? Character($0) : " " })
+        let t = String(mapped.trimmingCharacters(in: .whitespaces).prefix(max))
+        return t.isEmpty ? "app" : t
+    }
+
+    /// Engine names, tokens, URL parameters, names, metadata and user ids out.
+    static func scrub(_ line: String) -> String {
+        var s = line
+        // Built from parts so the SDK source itself stays free of these names.
+        let e1 = "live" + "kit", e2 = "web" + "rtc", e3 = "ago" + "ra"
+        let rules: [(String, String)] = [
+            (e1, "engine"), (e2, "rtc"), (e3, "vendor"),
+            ("\\beyJ[A-Za-z0-9_-]{6,}\\.[A-Za-z0-9_-]{6,}\\.[A-Za-z0-9_-]{6,}", "[token]"),
+            ("((?:https?|wss?)://[^\\s?#\"']+)\\?[^\\s\"']*", "$1?[redacted]"),
+            ("\\b(token|access_token|secret|password|key|authorization)(\\s*[=:]\\s*)(\"[^\"]*\"|[^\\s,;&)}\\]]+)", "$1$2[redacted]"),
+            ("\\b(name|displayName|metadata|attributes|userName|nickname)(\\s*[=:]\\s*)(\"[^\"]*\"|\\{[^}]*\\}|[^\\s,;)}\\]]+)", "$1$2[redacted]"),
+            ("\\b(uid|localUid|identity|userId)(\\s*[=:]\\s*)([^\\s,;)}\\]]+)", "$1$2[id]"),
+        ]
+        for (pattern, template) in rules {
+            s = s.replacingOccurrences(of: pattern, with: template, options: [.regularExpression, .caseInsensitive])
+        }
+        return String(s.prefix(1000))
+    }
+
+    /// (trigger, reason) or nil. An app request wins, then a problem, then remote collection.
+    static func decide(enabled: Bool, appReason: String?, problems: Set<String>, reconnects: Int, remote: Bool) -> (String, String?)? {
+        guard enabled else { return nil }
+        if let appReason { return ("app_requested", appReason) }
+        var all = problems
+        if reconnects >= 3 { all.insert("reconnects") }
+        if !all.isEmpty { return ("auto_problem", String(all.sorted().joined(separator: ",").prefix(64))) }
+        if remote { return ("remote_enabled", nil) }
+        return nil
+    }
+
+    private func snapshot(maxBytes: Int) -> [String] {
+        lock.lock()
+        let count = lines.count
+        var ordered: [(Date, String)] = []
+        for i in 0..<count {
+            let k = count < capacity ? i : (next + i) % capacity
+            ordered.append((times[k], lines[k]))
+        }
+        lock.unlock()
+        let fmt = DateFormatter()
+        fmt.dateFormat = "HH:mm:ss.SSS"
+        fmt.timeZone = TimeZone(identifier: "UTC")
+        var out: [String] = []
+        var bytes = 0
+        for (t, l) in ordered.reversed() {
+            let s = fmt.string(from: t) + " " + Self.scrub(l)
+            let n = s.utf8.count + 1
+            if bytes + n > maxBytes { break }
+            bytes += n
+            out.append(s)
+        }
+        return out.reversed()
+    }
+
+    private func maybeUpload(final: Bool, force: Bool) {
+        lock.lock()
+        let d = Self.decide(enabled: enabled, appReason: appReason, problems: problems, reconnects: reconnects, remote: remoteEnabled)
+        if final { problems.removeAll(); reconnects = 0 }
+        let t = token
+        let skip = d == nil || t == nil || (!final && !force && uploaded)
+        if !skip {
+            if d?.0 == "app_requested" { appReason = nil }
+            uploaded = true
+        }
+        let region = self.region
+        lock.unlock()
+        guard !skip, let d, let t else { return }
+        let lines = snapshot(maxBytes: 240 * 1024)
+        guard !lines.isEmpty else { return }
+        let v = ProcessInfo.processInfo.operatingSystemVersion
+        var payload: [String: Any] = [
+            "platform": "ios",
+            "sdkVersion": DeviceReports.sdkVersion,
+            "manufacturer": "Apple",
+            "osVersion": "\(v.majorVersion).\(v.minorVersion).\(v.patchVersion)",
+            "region": region,
+            "trigger": d.0,
+            "lines": lines,
+        ]
+        if let reason = d.1 { payload["reason"] = reason }
+        guard let body = try? JSONSerialization.data(withJSONObject: payload) else { return }
+        post(token: t, body: body) { [weak self] ok in
+            // No network: keep the latest one for the next join.
+            if !ok { self?.lock.lock(); self?.pending = body; self?.lock.unlock() }
+        }
+    }
+
+    private func fetchRemoteFlag(token: String) {
+        guard let url = URL(string: "\(DeviceReports.apiBase)/sdk/device-config?platform=ios&sdkVersion=\(DeviceReports.sdkVersion)") else { return }
+        var req = URLRequest(url: url, timeoutInterval: 3)
+        req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        URLSession.shared.dataTask(with: req) { [weak self] data, response, _ in
+            guard let self, let data, (response as? HTTPURLResponse)?.statusCode == 200,
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
+            let on = (json["diag"] as? [String: Any])?["enabled"] as? Bool ?? false
+            self.lock.lock(); self.remoteEnabled = on; self.lock.unlock()
+        }.resume()
+    }
+
+    /// `done(false)` only when the server could not be reached.
+    private func post(token: String, body: Data, done: @escaping (Bool) -> Void) {
+        guard let url = URL(string: "\(DeviceReports.apiBase)/sdk/diag") else { return }
+        var req = URLRequest(url: url, timeoutInterval: 10)
+        req.httpMethod = "POST"
+        req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = body
+        URLSession.shared.dataTask(with: req) { _, response, _ in done(response != nil) }.resume()
     }
 }

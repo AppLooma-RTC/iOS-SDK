@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Remote diagnostics: the SDK keeps its recent log lines and a stats snapshot every 10 s in memory (no audio, video or messages) and uploads them, scrubbed of names, metadata, user ids, tokens and URL parameters, after a call with a problem (codec fallback, a viewer reporting no picture, join failure, 3 or more reconnects), when support turned collection on for the device or project, or on the new `AppEngine.uploadDiagnostics(reason:)`. Opt out with `AppEngineOptions(remoteDiagnostics: false)`. Kept 14 days.
 - `AppEngineOptions.region` (`AppRegion`: `.auto` default, `.bd`, `.in`, `.sa`, `.sg`, `.us`). Preparation for multi-region: today every region connects to the same server URL your token endpoint returns. Sent with anonymous device reports and logged on join.
 - Token renewal: `AppEngineDelegate.appEngine(_:tokenWillExpire:)` fires about 30 s before the join token's `exp` (immediately when less is left), and `AppEngine.renewToken(_:)` stores the new token for the SDK's own later calls and re-arms the reminder. The live connection's credential is refreshed by the media server while connected.
 - Not yet on iOS: network/echo test and subscribe/publish fallback options (available on other platforms).
