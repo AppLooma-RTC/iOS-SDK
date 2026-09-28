@@ -1833,7 +1833,7 @@ public struct AppGiftEvent: Decodable {
 /// How the video encoder behaved on this phone (POST /v1/sdk/device-report).
 /// Fire-and-forget: every error is swallowed, a call is never affected.
 enum DeviceReports {
-    static let sdkVersion = "0.5.6"
+    static let sdkVersion = "0.5.7"
     static let apiBase = "https://api.applooma.dev/v1"
 
     private static func clean(_ s: String, _ max: Int) -> String {

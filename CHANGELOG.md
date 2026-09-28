@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.5.7 — 2026-09-28
 
 - Video enhancement: `AppEngine.setVideoEnhance(AppVideoEnhance(beauty:lowLight:sharpen:warmth:))` (nil turns it off; `.portrait` preset). Core Image on the camera frames before encoding: exposure and shadow lift for low light, noise reduction blend for beauty, luminance sharpening, temperature for warmth.
 - Clear Voice: `AppAudioOptions.noiseSuppressionMode` (`AppNoiseSuppression.standard` default, `.clear`, `.off`). `.clear` uses the voice-chat audio session mode in every scenario; `AppEngine.showMicrophoneModes()` opens the system Voice Isolation picker (iOS 15+), `AppEngine.isVoiceIsolationActive` reports it.
