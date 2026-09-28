@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.5.8 — 2026-09-28
 
 - UIKit: an Enhance button (beauty + low light, `.portrait`) in the call screen video controls and the live stream host controls.
 - Docs: `startNetworkTest` now states why round-trip time, jitter and loss read -1 / -1 / 0 on iOS: the test connection carries no media, and the media engine only exposes transport statistics per track. The iOS reference page names 0.5.2 for video modes.
