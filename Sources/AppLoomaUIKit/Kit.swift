@@ -207,6 +207,7 @@ class RoomModel: ObservableObject, AppEngineDelegate {
     let room: String
     let engine: AppEngine
     @Published var tick = 0
+    @Published var enhance = false
     @Published var chat: [ChatLine] = []
     @Published var speaking: Set<String> = []
     /// Loudspeaker (true) or earpiece (false); starts from the screen's scenario.

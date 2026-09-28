@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- UIKit: an Enhance button (beauty + low light, `.portrait`) in the call screen video controls and the live stream host controls.
+- Docs: `startNetworkTest` now states why round-trip time, jitter and loss read -1 / -1 / 0 on iOS: the test connection carries no media, and the media engine only exposes transport statistics per track. The iOS reference page names 0.5.2 for video modes.
+
 ## 0.5.7 — 2026-09-28
 
 - Video enhancement: `AppEngine.setVideoEnhance(AppVideoEnhance(beauty:lowLight:sharpen:warmth:))` (nil turns it off; `.portrait` preset). Core Image on the camera frames before encoding: exposure and shadow lift for low light, noise reduction blend for beauty, luminance sharpening, temperature for warmth.

@@ -123,6 +123,8 @@ public struct AppLoomaCallView: View {
                     if m.video {
                         RoundButton(icon: "arrow.triangle.2.circlepath.camera", label: "Flip") { Task { try? await m.engine.switchCamera() } }
                         Spacer()
+                        RoundButton(icon: "wand.and.stars", brand: m.enhance, label: "Enhance") { m.enhance.toggle(); m.engine.setVideoEnhance(m.enhance ? .portrait : nil) }
+                        Spacer()
                     }
                 }
                 .padding(.top, 30).padding(.bottom, 20)

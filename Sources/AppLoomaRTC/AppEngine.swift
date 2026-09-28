@@ -1518,7 +1518,9 @@ public final class AppEngine {
     /// quality estimate for about 5 s, leaves, and calls `completion` once on
     /// the main thread. Gives up after 10 s with `error` set. Does not touch
     /// the channel you are in. Honors `cloudProxy = .forceTls443`. Round-trip
-    /// time, jitter and loss are not measured on iOS yet (-1 / 0).
+    /// time, jitter and loss are not measured on iOS yet (-1 / -1 / 0): the
+    /// media engine only exposes transport statistics per published or
+    /// subscribed track, and this probe carries no media.
     public func startNetworkTest(serverUrl: String, token: String, completion: @escaping (AppNetworkTestResult) -> Void) {
         stopNetworkTest()
         let connectOptions = options.cloudProxy == .forceTls443 ? Self.relayConnectOptions : ConnectOptions(autoSubscribe: false)

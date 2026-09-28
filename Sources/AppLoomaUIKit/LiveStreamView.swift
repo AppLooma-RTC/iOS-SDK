@@ -116,6 +116,7 @@ public struct AppLoomaLiveStreamView: View {
                             RoundButton(icon: m.mic ? "mic.fill" : "mic.slash.fill", off: !m.mic) { m.mic.toggle(); let on = m.mic; Task { try? await m.engine.enableMicrophone(on) } }
                             RoundButton(icon: m.cam ? "video.fill" : "video.slash.fill", off: !m.cam) { m.cam.toggle(); let on = m.cam; Task { try? await m.engine.enableCamera(on) } }
                             RoundButton(icon: "arrow.triangle.2.circlepath.camera") { Task { try? await m.engine.switchCamera() } }
+                            RoundButton(icon: "wand.and.stars", brand: m.enhance) { m.enhance.toggle(); m.engine.setVideoEnhance(m.enhance ? .portrait : nil) }
                         }.padding(.trailing, 12)
                     }
                 }
