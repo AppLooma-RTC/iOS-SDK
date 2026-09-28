@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Video enhancement: `AppEngine.setVideoEnhance(AppVideoEnhance(beauty:lowLight:sharpen:warmth:))` (nil turns it off; `.portrait` preset). Core Image on the camera frames before encoding: exposure and shadow lift for low light, noise reduction blend for beauty, luminance sharpening, temperature for warmth.
+- Clear Voice: `AppAudioOptions.noiseSuppressionMode` (`AppNoiseSuppression.standard` default, `.clear`, `.off`). `.clear` uses the voice-chat audio session mode in every scenario; `AppEngine.showMicrophoneModes()` opens the system Voice Isolation picker (iOS 15+), `AppEngine.isVoiceIsolationActive` reports it.
+- Audience latency: `AppEngineOptions.audienceLatency` (`.ultraLow` default, `.low`, `.standard`), applied only while audience. No receive-buffer control on iOS: `.low` behaves like `.ultraLow`; `.standard` turns on the `.videoLowQuality` subscribe fallback unless the app set one.
+- Codec detection: `AppEngine.getSupportedVideoCodecs()` returns `AppVideoCodecCapability` (mime, hardware, encoder, decoder) for VP8, VP9, H.264 and, where VideoToolbox supports it, H.265.
+
 ## 0.5.6 — 2026-09-28
 
 - Cloud proxy for restrictive networks: `AppEngineOptions.cloudProxy` (`AppCloudProxy.auto` default, `.forceTls443`, `.off`). `.forceTls443` joins with relay-only transport through AppLooma's relay on TLS 443; `.auto` retries a join once that way when the direct join fails with a connection or network timeout, and logs it. New `AppEngineDelegate.appEngine(_:proxyStateChanged:autoRetry:)`, `AppProxyState` (`.direct`, `.connecting`, `.connected`) and `AppEngine.proxyState`.

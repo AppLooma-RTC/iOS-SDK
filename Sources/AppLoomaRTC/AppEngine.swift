@@ -10,6 +10,8 @@ import AppLoomaCore
 #if os(iOS)
 import AVFoundation
 import UIKit
+import CoreMedia
+import VideoToolbox
 #endif
 
 /// Roles supported by AppLooma RTC channels.
@@ -167,12 +169,47 @@ public struct AppAudioOptions: Sendable {
     public var echoCancellation: Bool
     public var noiseSuppression: Bool
     public var autoGainControl: Bool
+    /// Noise suppression mode, `.standard` by default. `noiseSuppression =
+    /// false` also means `.off`. See `AppNoiseSuppression`.
+    public var noiseSuppressionMode: AppNoiseSuppression
 
-    public init(echoCancellation: Bool = true, noiseSuppression: Bool = true, autoGainControl: Bool = true) {
+    public init(echoCancellation: Bool = true, noiseSuppression: Bool = true, autoGainControl: Bool = true,
+                noiseSuppressionMode: AppNoiseSuppression = .standard) {
         self.echoCancellation = echoCancellation
         self.noiseSuppression = noiseSuppression
         self.autoGainControl = autoGainControl
+        self.noiseSuppressionMode = noiseSuppressionMode
     }
+
+    /// The mode in force once `noiseSuppression` and `noiseSuppressionMode` are combined.
+    public var effectiveNoiseSuppression: AppNoiseSuppression { noiseSuppression ? noiseSuppressionMode : .off }
+}
+
+/// Noise suppression mode.
+///
+/// `.clear` ("Clear Voice") runs the microphone through Apple's voice
+/// processing in the voice-chat mode in every audio scenario, which is also
+/// what lets the user pick Voice Isolation from Control Center (see
+/// `AppEngine.showMicrophoneModes()`). There is no on-device neural model in
+/// the iOS SDK itself. `.off` turns the engine's suppressor off.
+public enum AppNoiseSuppression: Sendable {
+    case standard, clear, off
+}
+
+/// How much delay an audience member accepts for smoother playback; see
+/// `AppEngineOptions.audienceLatency`.
+public enum AppAudienceLatency: Sendable {
+    case ultraLow, low, standard
+}
+
+/// One video codec this device can handle, from `AppEngine.getSupportedVideoCodecs()`.
+/// `mime` is `"video/VP8"`, `"video/VP9"`, `"video/H264"` or `"video/H265"`.
+public struct AppVideoCodecCapability: Sendable, Equatable {
+    public let mime: String
+    /// True when the codec runs on the device's hardware (VideoToolbox).
+    public let hardware: Bool
+    public let encoder: Bool
+    public let decoder: Bool
 }
 
 /// Which server region the engine should prefer.
@@ -201,15 +238,24 @@ public struct AppEngineOptions: Sendable {
     /// Cloud proxy for networks that block UDP or most ports; `.auto` by
     /// default. See `AppCloudProxy` and `proxyStateChanged`.
     public var cloudProxy: AppCloudProxy
+    /// Audience latency tier, `.ultraLow` by default, applied only while the
+    /// local user is audience. The iOS engine has no receive-side
+    /// jitter-buffer control, so `.low` behaves like `.ultraLow`, and
+    /// `.standard` only prefers lower video layers under congestion (it turns
+    /// on `setRemoteSubscribeFallback(.videoLowQuality)` unless you set a
+    /// fallback yourself).
+    public var audienceLatency: AppAudienceLatency
 
     public init(audioScenario: AppAudioScenario = .call, video: AppVideoConfig = AppVideoConfig(), audio: AppAudioOptions = AppAudioOptions(),
-                region: AppRegion = .auto, remoteDiagnostics: Bool = true, cloudProxy: AppCloudProxy = .auto) {
+                region: AppRegion = .auto, remoteDiagnostics: Bool = true, cloudProxy: AppCloudProxy = .auto,
+                audienceLatency: AppAudienceLatency = .ultraLow) {
         self.audioScenario = audioScenario
         self.video = video
         self.audio = audio
         self.region = region
         self.remoteDiagnostics = remoteDiagnostics
         self.cloudProxy = cloudProxy
+        self.audienceLatency = audienceLatency
     }
 }
 
@@ -462,6 +508,8 @@ public final class AppEngine {
     public let appId: String
     public let options: AppEngineOptions
     public weak var delegate: AppEngineDelegate?
+    /// Built-in camera enhancement (see VideoEnhance.swift).
+    var videoEnhanceFilter: AppVideoEnhanceFilter?
 
     let room: Room
     private var users: [String: AppRemoteUser] = [:]
@@ -496,7 +544,7 @@ public final class AppEngine {
         self.activeDevice = device
         self.room = Room(roomOptions: Self.roomOptions(options, device: device))
         self.room.add(delegate: self)
-        Self.configureAudioSession(for: options.audioScenario)
+        Self.configureAudioSession(for: options.audioScenario, clearVoice: options.audio.effectiveNoiseSuppression == .clear)
         observeAudioRoute()
     }
 
@@ -788,7 +836,7 @@ public final class AppEngine {
             defaultAudioCaptureOptions: AudioCaptureOptions(
                 echoCancellation: o.audio.echoCancellation,
                 autoGainControl: o.audio.autoGainControl,
-                noiseSuppression: o.audio.noiseSuppression
+                noiseSuppression: o.audio.effectiveNoiseSuppression != .off
             ),
             defaultVideoPublishOptions: VideoPublishOptions(
                 encoding: encoding,
@@ -821,7 +869,7 @@ public final class AppEngine {
     /// playAndRecord + videoChat so the platform echo canceller is engaged —
     /// the plain playback category has no canceller, and a loudspeaker session
     /// then feeds itself back after a minute or two.
-    private static func configureAudioSession(for scenario: AppAudioScenario) {
+    private static func configureAudioSession(for scenario: AppAudioScenario, clearVoice: Bool = false) {
         #if os(iOS)
         AudioManager.shared.customConfigureAudioSessionFunc = { newState, _ in
             let session = AVAudioSession.sharedInstance()
@@ -832,7 +880,8 @@ public final class AppEngine {
                 }
                 switch scenario {
                 case .media:
-                    try session.setCategory(.playAndRecord, mode: .videoChat,
+                    // Clear Voice: voice-chat mode, the platform's strongest voice processing.
+                    try session.setCategory(.playAndRecord, mode: clearVoice ? .voiceChat : .videoChat,
                                             options: [.defaultToSpeaker, .allowBluetooth, .allowBluetoothA2DP, .mixWithOthers])
                 case .call:
                     try session.setCategory(.playAndRecord, mode: .voiceChat,
@@ -845,6 +894,41 @@ public final class AppEngine {
         }
         #endif
     }
+
+    #if os(iOS)
+    /// The video codecs this device can send and receive. H.264 is always
+    /// hardware on iOS; H.265 is listed when VideoToolbox can decode it in
+    /// hardware, and as an encoder when the device can also export HEVC.
+    /// VP8 and VP9 run in software.
+    public static func getSupportedVideoCodecs() -> [AppVideoCodecCapability] {
+        var out = [
+            AppVideoCodecCapability(mime: "video/VP8", hardware: false, encoder: true, decoder: true),
+            AppVideoCodecCapability(mime: "video/VP9", hardware: false, encoder: true, decoder: true),
+            AppVideoCodecCapability(mime: "video/H264", hardware: true, encoder: true,
+                                    decoder: VTIsHardwareDecodeSupported(kCMVideoCodecType_H264)),
+        ]
+        let hevcDecode = VTIsHardwareDecodeSupported(kCMVideoCodecType_HEVC)
+        let hevcEncode = AVAssetExportSession.allExportPresets().contains(AVAssetExportPresetHEVCHighestQuality)
+        if hevcDecode || hevcEncode {
+            out.append(AppVideoCodecCapability(mime: "video/H265", hardware: true, encoder: hevcEncode, decoder: hevcDecode))
+        }
+        return out
+    }
+
+    /// Opens the system microphone-mode picker (Standard, Voice Isolation,
+    /// Wide Spectrum) while the microphone is live. Voice Isolation is the
+    /// strongest noise removal on iOS and only the user can switch it on.
+    /// iOS 15 and later; does nothing before.
+    public static func showMicrophoneModes() {
+        if #available(iOS 15.0, *) { AVCaptureDevice.showSystemUserInterface(.microphoneModes) }
+    }
+
+    /// True while the user has Voice Isolation on for this app (iOS 15+).
+    public static var isVoiceIsolationActive: Bool {
+        if #available(iOS 15.0, *) { return AVCaptureDevice.activeMicrophoneMode == .voiceIsolation }
+        return false
+    }
+    #endif
 
     /// Create an engine instance with your AppLooma RTC App ID (applooma.dev/dashboard).
     public static func create(appId: String, delegate: AppEngineDelegate? = nil, options: AppEngineOptions = AppEngineOptions()) -> AppEngine {
@@ -899,6 +983,11 @@ public final class AppEngine {
         startStats()
         armTokenExpiry()
 
+        // Audience latency: no receive-side jitter-buffer control on iOS, so
+        // only `.standard` acts, by preferring lower video layers under congestion.
+        if options.role == .audience && self.options.audienceLatency == .standard && subscribeFallback == .none {
+            setRemoteSubscribeFallback(.videoLowQuality)
+        }
         if options.role != .audience {
             if options.microphone { try await room.localParticipant.setMicrophone(enabled: true) }
             if options.camera { try await room.localParticipant.setCamera(enabled: true) }
@@ -954,6 +1043,7 @@ public final class AppEngine {
     /// The local camera track was replaced (on/off, switch, config). Re-bind
     /// every self-view and tell the app.
     func notifyLocalVideoChanged() {
+        attachVideoEnhance()
         Task { @MainActor in
             #if canImport(UIKit)
             for view in self.localViews.allObjects { view.refreshLocal(engine: self) }
