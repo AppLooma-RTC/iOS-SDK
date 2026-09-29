@@ -1329,6 +1329,9 @@ public final class AppEngine {
             print("[AppLoomaRTC] Direct connection failed; retrying through the AppLooma cloud proxy (TLS 443)")
             proxyRetrying = true
             await room.disconnect()
+            // The disconnect event is delivered asynchronously; let it drain
+            // while the flag still hides it from the app.
+            try? await Task.sleep(nanoseconds: 300_000_000)
             proxyRetrying = false
             setProxyState(.connecting, autoRetry: true)
             do {
@@ -1715,9 +1718,15 @@ extension AppEngine: RoomDelegate {
         case .reconnecting: mapped = .reconnecting
         default: mapped = .disconnected
         }
+        if case .disconnected = state, proxyRetrying {
+            // Our own teardown of the failed direct attempt before the
+            // cloud-proxy retry; the app must not see a disconnect.
+            diag.log("disconnect of the failed direct attempt ignored (retrying through the cloud proxy)")
+            return
+        }
         diag.log("connection \(mapped)")
         if case .reconnecting = state { diag.reconnecting() }
-        if case .disconnected = state, !proxyRetrying {
+        if case .disconnected = state {
             diag.end("disconnected")
             isJoined = false
             stopStats()

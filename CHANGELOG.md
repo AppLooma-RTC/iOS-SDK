@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Cloud proxy auto-retry no longer reports a disconnect to the app while it switches to the relay.
+
 ## 0.5.8 — 2026-09-28
 
 - UIKit: an Enhance button (beauty + low light, `.portrait`) in the call screen video controls and the live stream host controls.
