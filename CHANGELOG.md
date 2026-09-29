@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.5.9 — 2026-09-29
 
 - Cloud proxy auto-retry no longer reports a disconnect to the app while it switches to the relay.
 
