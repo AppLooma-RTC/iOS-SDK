@@ -142,7 +142,7 @@ public struct AppVideoConfig: Sendable {
     public var simulcast: Bool?
     public var codec: AppVideoCodec
     /// What to give up first under pressure. See `AppVideoDegradation`.
-    /// `.auto` = chosen by `mode` (`.keepResolution` in `.stableHd` and `.ultraHd4k`).
+    /// `.auto` = chosen by `mode` (`.balanced` in `.stableHd`, `.keepResolution` in `.ultraHd4k`).
     public var degradation: AppVideoDegradation
     /// The overall tuning; see `AppVideoMode`.
     public var mode: AppVideoMode
@@ -824,7 +824,10 @@ public final class AppEngine {
         let maxFps = device.maxFps > 0 ? min(o.video.fps, device.maxFps) : o.video.fps
         let encoding = VideoEncoding(maxBitrate: maxBitrate, maxFps: maxFps)
         let simulcast = (simulcastOverride ?? o.video.simulcast ?? adaptive) && !device.disableSimulcast
-        let wantedDegradation: AppVideoDegradation = o.video.degradation == .auto && !adaptive ? .keepResolution : o.video.degradation
+        // .stableHd gives up a little resolution and frame rate while bandwidth
+        // ramps up; holding full size from the first second started live streams
+        // at a few frames per second. .ultraHd4k still keeps resolution.
+        let wantedDegradation: AppVideoDegradation = o.video.degradation != .auto ? o.video.degradation : (adaptive ? .auto : (mode == .ultraHd4k ? .keepResolution : .balanced))
         let preferred: VideoCodec
         switch codec {
         case "h264": preferred = .h264
@@ -1844,7 +1847,7 @@ public struct AppGiftEvent: Decodable {
 /// How the video encoder behaved on this phone (POST /v1/sdk/device-report).
 /// Fire-and-forget: every error is swallowed, a call is never affected.
 enum DeviceReports {
-    static let sdkVersion = "0.5.9"
+    static let sdkVersion = "0.5.10"
     static let apiBase = "https://api.applooma.dev/v1"
 
     private static func clean(_ s: String, _ max: Int) -> String {
