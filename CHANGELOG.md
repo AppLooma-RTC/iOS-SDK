@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.6.0 — 2026-10-12
 
 - Camera frame processing for apps: `AppEngine.setVideoProcessor(_:)` with the new `AppVideoFrameProcessor` protocol (`process(_ pixelBuffer:rotation:timestamp:) -> CVPixelBuffer`). It runs on the local camera after the built-in enhancement, before encoding and the local preview, and survives camera off/on, switches and republishes. Looma Beauty Camera for iOS uses it.
 
