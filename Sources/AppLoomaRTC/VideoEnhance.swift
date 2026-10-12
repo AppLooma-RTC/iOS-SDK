@@ -152,6 +152,18 @@ extension AppEngine {
     /// holds its processor weakly; the engine keeps the strong reference.
     func attachVideoEnhance() {
         guard let capturer = (localVideoTrack as? LocalVideoTrack)?.capturer else { return }
-        if capturer.processor !== videoEnhanceFilter { capturer.processor = videoEnhanceFilter }
+        // With an app processor set, a chain runs the enhancement first, then it.
+        let wanted: VideoProcessor?
+        if let app = videoFrameProcessor {
+            let chain = videoProcessorChain ?? AppVideoProcessorChain()
+            chain.enhance = videoEnhanceFilter
+            chain.app = app
+            videoProcessorChain = chain
+            wanted = chain
+        } else {
+            videoProcessorChain = nil
+            wanted = videoEnhanceFilter
+        }
+        if capturer.processor !== wanted { capturer.processor = wanted }
     }
 }

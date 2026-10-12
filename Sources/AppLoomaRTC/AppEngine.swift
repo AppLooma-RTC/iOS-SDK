@@ -510,6 +510,10 @@ public final class AppEngine {
     public weak var delegate: AppEngineDelegate?
     /// Built-in camera enhancement (see VideoEnhance.swift).
     var videoEnhanceFilter: AppVideoEnhanceFilter?
+    /// App frame processor (see VideoFrameProcessor.swift), and the chain that
+    /// runs the enhancement then it on the camera capturer.
+    var videoFrameProcessor: AppVideoFrameProcessor?
+    var videoProcessorChain: AppVideoProcessorChain?
 
     let room: Room
     private var users: [String: AppRemoteUser] = [:]
