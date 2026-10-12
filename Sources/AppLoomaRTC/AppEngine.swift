@@ -328,11 +328,15 @@ public struct AppJoinOptions: Sendable {
     public var camera: Bool
     /// Auto-enable microphone on join (ignored for audience).
     public var microphone: Bool
+    /// Connect to the AppLooma media server best placed for this device and room
+    /// (applooma.dev URLs only; falls back to the given URL on any failure). Since 0.6.1.
+    public var smartRouting: Bool
 
-    public init(role: AppRole = .host, camera: Bool = false, microphone: Bool = true) {
+    public init(role: AppRole = .host, camera: Bool = false, microphone: Bool = true, smartRouting: Bool = true) {
         self.role = role
         self.camera = camera
         self.microphone = microphone
+        self.smartRouting = smartRouting
     }
 }
 
@@ -952,6 +956,8 @@ public final class AppEngine {
     /// (POST https://api.applooma.dev/v1/token → { token, wsUrl }).
     public func joinChannel(token: String, wsUrl: String, options: AppJoinOptions = AppJoinOptions()) async throws {
         guard !isJoined else { throw AppError.alreadyJoined }
+        // Smart routing: pick the media server for this device / room (our own URLs only).
+        let routedUrl = options.smartRouting ? await SmartRoute.resolve(token: token, wsUrl: wsUrl) : wsUrl
         joinStartedAt = Date()
         fallbackUsed = false
         viewerReports.removeAll()
@@ -970,7 +976,7 @@ public final class AppEngine {
         // Auto-subscribe so an audience member (and every co-host) receives all
         // published tracks the moment they join.
         do {
-            try await connectWithProxy(url: wsUrl, token: token,
+            try await connectWithProxy(url: routedUrl, token: token,
                                        roomOptions: Self.roomOptions(self.options, codecOverride: codecOverride, simulcastOverride: simulcastOverride, device: activeDevice))
         } catch {
             diag.log("join failed: \(error)")
@@ -1851,7 +1857,7 @@ public struct AppGiftEvent: Decodable {
 /// How the video encoder behaved on this phone (POST /v1/sdk/device-report).
 /// Fire-and-forget: every error is swallowed, a call is never affected.
 enum DeviceReports {
-    static let sdkVersion = "0.6.0"
+    static let sdkVersion = "0.6.1"
     static let apiBase = "https://api.applooma.dev/v1"
 
     private static func clean(_ s: String, _ max: Int) -> String {
@@ -2261,5 +2267,34 @@ enum DeviceConfigStore {
         defaults.set(http.value(forHTTPHeaderField: "ETag"), forKey: prefix + "etag")
         defaults.set(now, forKey: prefix + "at")
         lock.lock(); cached = cfg; lock.unlock()
+    }
+}
+
+/// Smart routing: asks the AppLooma API which media server suits this device
+/// and the room. Only used for our own wsUrls; any failure keeps the app's URL.
+enum SmartRoute {
+    static func isOurs(_ url: String) -> Bool {
+        guard let host = URL(string: url)?.host?.lowercased() else { return false }
+        return host == "applooma.dev" || host.hasSuffix(".applooma.dev")
+    }
+
+    static func resolve(token: String, wsUrl: String) async -> String {
+        guard isOurs(wsUrl), let url = URL(string: "\(DeviceReports.apiBase)/rtc/route") else { return wsUrl }
+        var req = URLRequest(url: url, timeoutInterval: 2)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.setValue("application/json", forHTTPHeaderField: "Accept")
+        guard let body = try? JSONSerialization.data(withJSONObject: ["token": token]) else { return wsUrl }
+        req.httpBody = body
+        let (data, response): (Data?, URLResponse?) = await withCheckedContinuation { cont in
+            URLSession.shared.dataTask(with: req) { data, response, _ in cont.resume(returning: (data, response)) }.resume()
+        }
+        guard let data = data, (response as? HTTPURLResponse)?.statusCode == 200,
+              let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let routed = json["wsUrl"] as? String, !routed.isEmpty, isOurs(routed) else { return wsUrl }
+        #if DEBUG
+        if let region = json["region"] as? String { print("[AppLoomaRTC] route region=\(region)") }
+        #endif
+        return routed
     }
 }
