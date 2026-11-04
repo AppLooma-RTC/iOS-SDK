@@ -975,14 +975,28 @@ public final class AppEngine {
         print("[AppLoomaRTC] joining (region: \(self.options.region.rawValue))")
         // Auto-subscribe so an audience member (and every co-host) receives all
         // published tracks the moment they join.
+        let epoch = joinEpoch
         do {
             try await connectWithProxy(url: routedUrl, token: token,
-                                       roomOptions: Self.roomOptions(self.options, codecOverride: codecOverride, simulcastOverride: simulcastOverride, device: activeDevice))
+                                       roomOptions: Self.roomOptions(self.options, codecOverride: codecOverride, simulcastOverride: simulcastOverride, device: activeDevice),
+                                       epoch: epoch)
         } catch {
+            if epoch != joinEpoch {
+                // leaveChannel() was called before the join finished: the user left.
+                diag.log("join abandoned: left before connected")
+                throw AppJoinAbandonedError()
+            }
             diag.log("join failed: \(error)")
             diag.problem("join_failed")
             diag.end("join failed")
             throw error
+        }
+        if epoch != joinEpoch {
+            // Left while the connect was finishing: do not stay in the room as a
+            // second copy of this user (it would push the real session out).
+            diag.log("join abandoned: left while connecting; disconnecting")
+            await room.disconnect()
+            throw AppJoinAbandonedError()
         }
         isJoined = true
         diag.log("connected in \(elapsedMs()) ms")
@@ -1007,7 +1021,11 @@ public final class AppEngine {
         }
     }
 
+    /// Bumped by leaveChannel(); a join that sees it change was abandoned, not failed.
+    private var joinEpoch = 0
+
     public func leaveChannel() async {
+        joinEpoch += 1
         diag.end("leave")
         stopStats()
         cancelTokenExpiry()
@@ -1072,6 +1090,46 @@ public final class AppEngine {
     ///
     /// Nothing is stored, so a message reaches whoever is present when it is sent.
     @discardableResult
+    /// Reads stored chat for the channel you joined, newest first. Only
+    /// messages your server stored through the chat API are returned;
+    /// `sendMessage` is not stored. Uses the join token, so no server of yours
+    /// is involved. Pass `nextBefore` as `before` for the older page. Throws
+    /// `AppServiceError` (code `CHAT_NOT_IN_PLAN` when the plan has no stored chat).
+    public func loadHistory(limit: Int? = nil, before: Date? = nil) async throws -> AppHistoryPage {
+        guard let token = joinToken else { throw AppServiceError(code: "NOT_JOINED", message: "Join a channel before loading its history") }
+        var comps = URLComponents(string: "\(DeviceReports.apiBase)/chat/history")!
+        var items: [URLQueryItem] = []
+        if let limit { items.append(URLQueryItem(name: "limit", value: String(limit))) }
+        if let before {
+            let f = ISO8601DateFormatter()
+            f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+            items.append(URLQueryItem(name: "before", value: f.string(from: before)))
+        }
+        if !items.isEmpty { comps.queryItems = items }
+        var req = URLRequest(url: comps.url!, timeoutInterval: 15)
+        req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        let (data, response) = try await URLSession.shared.data(for: req)
+        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+        let body = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] ?? [:]
+        guard (200...299).contains(status) else {
+            throw AppServiceError(code: body["code"] as? String ?? "HISTORY_FAILED",
+                                  message: body["error"] as? String ?? "Could not load history (\(status))")
+        }
+        let list = body["messages"] as? [[String: Any]] ?? []
+        let messages = list.map { m in
+            AppStoredMessage(
+                id: m["id"] as? String ?? "",
+                sender: m["sender"] as? String ?? "",
+                senderName: m["senderName"] as? String,
+                text: m["text"] as? String,
+                data: m["data"] as? [String: Any],
+                kind: m["kind"] as? String ?? "text",
+                deleted: m["deleted"] as? Bool ?? false,
+                createdAt: parseIsoDate(m["createdAt"]) ?? Date(timeIntervalSince1970: 0))
+        }
+        return AppHistoryPage(messages: messages, nextBefore: parseIsoDate(body["nextBefore"]))
+    }
+
     public func sendMessage(
         text: String? = nil,
         data: [String: Any]? = nil,
@@ -1321,7 +1379,7 @@ public final class AppEngine {
     /// out in its ICE servers (TLS on 443).
     private static let relayConnectOptions = ConnectOptions(autoSubscribe: true, iceTransportPolicy: .relay)
 
-    private func connectWithProxy(url: String, token: String, roomOptions: RoomOptions) async throws {
+    private func connectWithProxy(url: String, token: String, roomOptions: RoomOptions, epoch: Int? = nil) async throws {
         let mode = options.cloudProxy
         if mode == .forceTls443 {
             setProxyState(.connecting, autoRetry: false)
@@ -1337,7 +1395,7 @@ public final class AppEngine {
         do {
             try await room.connect(url: url, token: token, connectOptions: ConnectOptions(autoSubscribe: true), roomOptions: roomOptions)
         } catch {
-            guard mode == .auto, Self.isProxyRetryable(error) else { throw error }
+            guard mode == .auto, epoch == nil || epoch == joinEpoch, Self.isProxyRetryable(error) else { throw error }
             diag.log("direct join failed; retrying once through the cloud proxy on TLS 443")
             print("[AppLoomaRTC] Direct connection failed; retrying through the AppLooma cloud proxy (TLS 443)")
             proxyRetrying = true
@@ -1658,6 +1716,52 @@ public enum AppError: Error {
     case alreadyJoined
 }
 
+/// Thrown by `joinChannel` when `leaveChannel()` was called before the join
+/// finished. The user left; nothing went wrong, so it is safe to ignore.
+public struct AppJoinAbandonedError: Error {
+    public let code = "JOIN_ABANDONED"
+    public init() {}
+}
+
+/// A request to the AppLooma service failed. `code` is stable, e.g. `CHAT_NOT_IN_PLAN`.
+public struct AppServiceError: Error, LocalizedError {
+    public let code: String
+    public let message: String
+    public var errorDescription: String? { message }
+}
+
+/// One message read back from stored chat (see `AppEngine.loadHistory`).
+public struct AppStoredMessage {
+    public let id: String
+    /// Who sent it, in your own identity space.
+    public let sender: String
+    /// Their display name when they sent it.
+    public let senderName: String?
+    /// Nil when the message was recalled.
+    public let text: String?
+    public let data: [String: Any]?
+    public let kind: String
+    /// True for a recalled message. It keeps its place in the thread.
+    public let deleted: Bool
+    /// Server time, safe to order by.
+    public let createdAt: Date
+}
+
+/// One page of stored chat, newest first. `nextBefore` is nil when there is no older page.
+public struct AppHistoryPage {
+    public let messages: [AppStoredMessage]
+    public let nextBefore: Date?
+}
+
+private func parseIsoDate(_ value: Any?) -> Date? {
+    guard let s = value as? String else { return nil }
+    let f = ISO8601DateFormatter()
+    f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    if let d = f.date(from: s) { return d }
+    f.formatOptions = [.withInternetDateTime]
+    return f.date(from: s)
+}
+
 // MARK: - RoomDelegate bridge
 
 extension AppEngine: RoomDelegate {
@@ -1857,7 +1961,7 @@ public struct AppGiftEvent: Decodable {
 /// How the video encoder behaved on this phone (POST /v1/sdk/device-report).
 /// Fire-and-forget: every error is swallowed, a call is never affected.
 enum DeviceReports {
-    static let sdkVersion = "0.6.1"
+    static let sdkVersion = "0.6.2"
     static let apiBase = "https://api.applooma.dev/v1"
 
     private static func clean(_ s: String, _ max: Int) -> String {

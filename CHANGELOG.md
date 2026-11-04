@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.6.2 — 2026-11-04
+
+- `joinChannel` throws `AppJoinAbandonedError` when `leaveChannel()` runs before it finishes; no cloud-proxy retry is started. A join that finishes after leave disconnects at once instead of pushing the same user's session out of the room.
+- Stored chat: `loadHistory(limit:before:)` returns `AppHistoryPage` (`AppStoredMessage` list, `nextBefore`), using the join token; errors are `AppServiceError` (`CHAT_NOT_IN_PLAN`).
+
 ## 0.6.1 — 2026-10-12
 
 - Smart routing: just before connecting, the SDK asks the AppLooma API which media server suits this device; the first caller pins the room and everyone else follows it. Only applies to applooma.dev URLs, with a 2 s timeout and a silent fallback to the URL you passed. Opt out with `AppJoinOptions(smartRouting: false)`.
