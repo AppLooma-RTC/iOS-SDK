@@ -1980,8 +1980,8 @@ extension AppEngine: RoomDelegate {
             return
         }
         guard let user = users[uid], user.participant === participant else { return }
-        // The server's reason, kept on the participant by the transport core (3.0.4+).
-        let reason = Self.leaveReason(code: participant.lastDisconnectReason?.rawValue)
+        // The server's reason, kept on the participant by the transport core (3.0.5+).
+        let reason = Self.leaveReason(code: participant.lastDisconnectReasonCode)
         let grace = options.remoteLeaveGraceMs
         if grace > 0, Self.holdsForReturn(reason), pendingLeaves[uid] == nil {
             diag.log("user dropped uid=\(uid); holding \(grace / 1000) s")

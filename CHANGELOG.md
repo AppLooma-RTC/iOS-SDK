@@ -2,7 +2,7 @@
 
 ## 0.7.1 — 2026-11-11
 
-- `userLeft(_:reason:)` now carries the server's real reason (`.quit`, `.kicked`, `.duplicateIdentity`, `.roomClosed`, `.dropped`) via transport core 3.0.4. Only unexplained drops are held for the grace period.
+- `userLeft(_:reason:)` now carries the server's real reason (`.quit`, `.kicked`, `.duplicateIdentity`, `.roomClosed`, `.dropped`) via transport core 3.0.5. Only unexplained drops are held for the grace period.
 
 ## 0.7.0 — 2026-11-11
 
