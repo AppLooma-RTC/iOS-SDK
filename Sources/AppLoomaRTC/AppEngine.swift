@@ -19,9 +19,29 @@ public enum AppRole: String, Sendable {
     case host, cohost, audience
 }
 
-/// Connection lifecycle states.
+/// Your own connection, as one state machine.
 public enum AppConnectionState: Sendable {
-    case connecting, connected, reconnecting, disconnected
+    case connecting, connected, reconnecting, disconnected, failed
+}
+
+/// Why `connectionStateChanged` fired.
+public enum AppConnectionReason: Sendable {
+    case joinSuccess, joinFailed, networkLost, networkRestored, tokenExpired
+    case kicked, duplicateIdentity, roomClosed, leaveChannel, unknown
+}
+
+/// Why a remote user is no longer in the channel. `.quit`: they left on
+/// purpose. `.dropped`: their connection failed and did not come back within
+/// the grace period. `.kicked`: your server removed them. `.roomClosed`: the
+/// room ended. `.unknown`: no reason was reported.
+public enum AppLeaveReason: Sendable {
+    case quit, dropped, kicked, duplicateIdentity, roomClosed, unknown
+}
+
+/// A remote user's presence: in the channel, or dropped and inside
+/// `AppEngineOptions.remoteLeaveGraceMs`.
+public enum AppUserState: Sendable {
+    case active, reconnecting
 }
 
 /// Milestones on the way to seeing a remote picture, each with elapsed
@@ -245,10 +265,15 @@ public struct AppEngineOptions: Sendable {
     /// on `setRemoteSubscribeFallback(.videoLowQuality)` unless you set a
     /// fallback yourself).
     public var audienceLatency: AppAudienceLatency
+    /// How long a remote user whose connection dropped is kept in the roster
+    /// as `.reconnecting` before `userLeft` reports them as `.dropped`. If they
+    /// come back in time you get `userStateChanged` `.active` instead of a
+    /// leave and a join. 0 reports the leave at once. Default 20 000 ms.
+    public var remoteLeaveGraceMs: Int
 
     public init(audioScenario: AppAudioScenario = .call, video: AppVideoConfig = AppVideoConfig(), audio: AppAudioOptions = AppAudioOptions(),
                 region: AppRegion = .auto, remoteDiagnostics: Bool = true, cloudProxy: AppCloudProxy = .auto,
-                audienceLatency: AppAudienceLatency = .ultraLow) {
+                audienceLatency: AppAudienceLatency = .ultraLow, remoteLeaveGraceMs: Int = 20_000) {
         self.audioScenario = audioScenario
         self.video = video
         self.audio = audio
@@ -256,6 +281,7 @@ public struct AppEngineOptions: Sendable {
         self.remoteDiagnostics = remoteDiagnostics
         self.cloudProxy = cloudProxy
         self.audienceLatency = audienceLatency
+        self.remoteLeaveGraceMs = remoteLeaveGraceMs
     }
 }
 
@@ -360,8 +386,16 @@ public struct AppMessage {
 
 /// A remote user in the channel.
 public final class AppRemoteUser {
-    let participant: RemoteParticipant
+    private(set) var participant: RemoteParticipant
     init(_ p: RemoteParticipant) { participant = p }
+    /// Rebound when the same identity comes back after a drop (new transport participant, same user).
+    func rebind(_ p: RemoteParticipant) { participant = p }
+    /// The role last reported to the app, to tell a real change from a metadata rewrite.
+    var lastKnownRole: AppRole?
+    /// Why this user left, once they have. Nil while they are in the channel.
+    public internal(set) var leaveReason: AppLeaveReason?
+    /// `.active`, or `.reconnecting` while their dropped connection is inside the grace period.
+    public internal(set) var state: AppUserState = .active
 
     public var uid: String { participant.identity?.stringValue ?? "" }
     public var displayName: String? { participant.name }
@@ -428,9 +462,25 @@ public final class AppRemoteUser {
 /// Channel event callbacks. All delivered on the main actor.
 public protocol AppEngineDelegate: AnyObject {
     func appEngine(_ engine: AppEngine, userJoined user: AppRemoteUser)
+    /// A remote user left. Both overloads are called. Not fired when *your own*
+    /// connection drops: that is `connectionStateChanged` `.disconnected` alone.
     func appEngine(_ engine: AppEngine, userLeft user: AppRemoteUser)
+    /// A remote user left, with why. `.quit` means on purpose, `.dropped` that
+    /// their network failed for longer than `remoteLeaveGraceMs`.
+    func appEngine(_ engine: AppEngine, userLeft user: AppRemoteUser, reason: AppLeaveReason)
+    /// A remote user's connection dropped (`.reconnecting`) or came back
+    /// (`.active`) within the grace period. Show "weak network" on their tile.
+    func appEngine(_ engine: AppEngine, userStateChanged user: AppRemoteUser, state: AppUserState)
+    /// Another user's role changed without them leaving (promoted or demoted by your server).
+    func appEngine(_ engine: AppEngine, userRoleChanged user: AppRemoteUser, from oldRole: AppRole, to newRole: AppRole)
+    /// After a reconnect: who is in the channel now. People who stayed are not announced again.
+    func appEngine(_ engine: AppEngine, usersResynced users: [AppRemoteUser])
     func appEngine(_ engine: AppEngine, trackSubscribedFor user: AppRemoteUser)
     func appEngine(_ engine: AppEngine, connectionStateChanged state: AppConnectionState)
+    /// Your own connection as one state machine, with why: `.tokenExpired`
+    /// means mint a new token, `.kicked` means your server removed you,
+    /// `.networkLost` means show "Reconnecting…".
+    func appEngine(_ engine: AppEngine, connectionStateChanged state: AppConnectionState, reason: AppConnectionReason)
     /// Someone sent a message with `sendMessage`.
     func appEngine(_ engine: AppEngine, messageReceived message: AppMessage)
     /// The audience changed — someone started or stopped watching.
@@ -483,8 +533,13 @@ public protocol AppEngineDelegate: AnyObject {
 public extension AppEngineDelegate {
     func appEngine(_ engine: AppEngine, userJoined user: AppRemoteUser) {}
     func appEngine(_ engine: AppEngine, userLeft user: AppRemoteUser) {}
+    func appEngine(_ engine: AppEngine, userLeft user: AppRemoteUser, reason: AppLeaveReason) {}
+    func appEngine(_ engine: AppEngine, userStateChanged user: AppRemoteUser, state: AppUserState) {}
+    func appEngine(_ engine: AppEngine, userRoleChanged user: AppRemoteUser, from oldRole: AppRole, to newRole: AppRole) {}
+    func appEngine(_ engine: AppEngine, usersResynced users: [AppRemoteUser]) {}
     func appEngine(_ engine: AppEngine, trackSubscribedFor user: AppRemoteUser) {}
     func appEngine(_ engine: AppEngine, connectionStateChanged state: AppConnectionState) {}
+    func appEngine(_ engine: AppEngine, connectionStateChanged state: AppConnectionState, reason: AppConnectionReason) {}
     func appEngine(_ engine: AppEngine, messageReceived message: AppMessage) {}
     func appEngine(_ engine: AppEngine, audienceChanged audience: [AppRemoteUser]) {}
     func appEngine(_ engine: AppEngine, dataReceived data: Data, from user: AppRemoteUser?) {}
@@ -522,6 +577,108 @@ public final class AppEngine {
     let room: Room
     private var users: [String: AppRemoteUser] = [:]
     public private(set) var isJoined = false
+
+    /// Your own connection as one state machine; see `connectionStateChanged`.
+    public private(set) var connectionState: AppConnectionState = .disconnected
+    /// Remote users whose connection dropped and who are still inside remoteLeaveGraceMs.
+    private var pendingLeaves: [String: Task<Void, Never>] = [:]
+    /// True between reconnecting and reconnected: remote "disconnects" in that window are the transport's, not the users'.
+    private var rosterFrozen = false
+
+    private func setConnectionState(_ state: AppConnectionState, _ reason: AppConnectionReason) {
+        if connectionState == state, state != .connected { return }
+        connectionState = state
+        diag.log("connection \(state) reason=\(reason)")
+        Task { @MainActor in
+            self.delegate?.appEngine(self, connectionStateChanged: state)
+            self.delegate?.appEngine(self, connectionStateChanged: state, reason: reason)
+        }
+    }
+
+    private static func connectionReason(of error: TransportError?) -> AppConnectionReason {
+        guard let error else { return .unknown }
+        switch error.type {
+        case .duplicateIdentity: return .duplicateIdentity
+        case .participantRemoved: return .kicked
+        case .serverShutdown, .roomDeleted: return .roomClosed
+        case .stateMismatch, .network, .timedOut, .serverPingTimedOut: return .networkLost
+        case .joinFailure: return .joinFailed
+        default: return .unknown
+        }
+    }
+
+    private func deliverUserLeft(_ u: AppRemoteUser, _ reason: AppLeaveReason) {
+        u.leaveReason = reason
+        Task { @MainActor in
+            self.delegate?.appEngine(self, userLeft: u)
+            self.delegate?.appEngine(self, userLeft: u, reason: reason)
+        }
+    }
+
+    /// The grace period ran out: the dropped user is gone for real.
+    private func expireLeave(_ uid: String) {
+        pendingLeaves.removeValue(forKey: uid)
+        health.removeValue(forKey: uid)
+        guard let u = users.removeValue(forKey: uid) else { return }
+        diag.log("user left after grace uid=\(uid)")
+        deliverUserLeft(u, .dropped)
+        Task { @MainActor in self.delegate?.appEngine(self, audienceChanged: self.audience) }
+    }
+
+    /// A dropped user came back on a new transport participant: same person, no leave, no join.
+    private func resumeUser(_ u: AppRemoteUser, _ p: RemoteParticipant) {
+        pendingLeaves.removeValue(forKey: u.uid)?.cancel()
+        u.rebind(p)
+        u.state = .active
+        u.leaveReason = nil
+        diag.log("user back within grace uid=\(u.uid)")
+        var hasTrack = false
+        for pub in p.trackPublications.values {
+            if let track = pub.track { hasTrack = true; watch(track, for: u) }
+        }
+        let has = hasTrack
+        Task { @MainActor in
+            self.delegate?.appEngine(self, userStateChanged: u, state: .active)
+            if has { self.delegate?.appEngine(self, trackSubscribedFor: u) }
+        }
+    }
+
+    private func cancelPendingLeaves() {
+        for task in pendingLeaves.values { task.cancel() }
+        pendingLeaves.removeAll()
+    }
+
+    /// After a reconnect: report who left while we were away (`.dropped`) and
+    /// who is new, without announcing again the people who stayed.
+    private func resyncAfterReconnect() {
+        var present: [String: RemoteParticipant] = [:]
+        for p in room.remoteParticipants.values { present[p.identity?.stringValue ?? ""] = p }
+        for u in users.values { if let p = present[u.uid], u.participant !== p { u.rebind(p) } }
+        for uid in Array(pendingLeaves.keys) {
+            if let u = users[uid], let p = present[uid] { resumeUser(u, p) } else { pendingLeaves.removeValue(forKey: uid)?.cancel() }
+        }
+        let gone = users.keys.filter { present[$0] == nil }
+        let added = present.keys.filter { users[$0] == nil }
+        for uid in gone {
+            health.removeValue(forKey: uid)
+            if let u = users.removeValue(forKey: uid) { deliverUserLeft(u, .dropped) }
+        }
+        for uid in added {
+            guard let p = present[uid] else { continue }
+            let user = userFor(p)
+            var hasTrack = false
+            for pub in p.trackPublications.values { if let track = pub.track { hasTrack = true; watch(track, for: user) } }
+            let has = hasTrack
+            Task { @MainActor in
+                self.delegate?.appEngine(self, userJoined: user)
+                if has { self.delegate?.appEngine(self, trackSubscribedFor: user) }
+            }
+        }
+        if !gone.isEmpty || !added.isEmpty {
+            diag.log("resync after reconnect: gone=\(gone.count) added=\(added.count)")
+            Task { @MainActor in self.delegate?.appEngine(self, audienceChanged: self.audience) }
+        }
+    }
 
     // Per-remote-user health, folded from track statistics.
     private final class Health {
@@ -976,6 +1133,8 @@ public final class AppEngine {
         // Auto-subscribe so an audience member (and every co-host) receives all
         // published tracks the moment they join.
         let epoch = joinEpoch
+        leaving = false
+        setConnectionState(.connecting, .joinSuccess)
         do {
             try await connectWithProxy(url: routedUrl, token: token,
                                        roomOptions: Self.roomOptions(self.options, codecOverride: codecOverride, simulcastOverride: simulcastOverride, device: activeDevice),
@@ -989,6 +1148,7 @@ public final class AppEngine {
             diag.log("join failed: \(error)")
             diag.problem("join_failed")
             diag.end("join failed")
+            setConnectionState(.failed, .joinFailed)
             throw error
         }
         if epoch != joinEpoch {
@@ -1000,6 +1160,7 @@ public final class AppEngine {
         }
         isJoined = true
         diag.log("connected in \(elapsedMs()) ms")
+        setConnectionState(.connected, .joinSuccess)
         let ms = elapsedMs()
         Task { @MainActor in self.delegate?.appEngine(self, connectionStage: .connected, uid: nil, elapsedMs: ms) }
 
@@ -1023,9 +1184,13 @@ public final class AppEngine {
 
     /// Bumped by leaveChannel(); a join that sees it change was abandoned, not failed.
     private var joinEpoch = 0
+    /// Set while leaveChannel() runs, so the resulting disconnect is reported as `.leaveChannel`.
+    private var leaving = false
 
     public func leaveChannel() async {
         joinEpoch += 1
+        leaving = true
+        cancelPendingLeaves()
         diag.end("leave")
         stopStats()
         cancelTokenExpiry()
@@ -1768,23 +1933,58 @@ extension AppEngine: RoomDelegate {
     public func room(_ room: Room, participant: RemoteParticipant, didUpdateMetadata metadata: String?) {
         // A promotion or demotion rewrites the token metadata, which is how
         // someone moves between the stage and the audience mid-session.
-        Task { @MainActor in self.delegate?.appEngine(self, audienceChanged: self.audience) }
+        let user = userFor(participant)
+        let old = user.lastKnownRole ?? user.role
+        let now = user.role
+        user.lastKnownRole = now
+        Task { @MainActor in
+            if old != now { self.delegate?.appEngine(self, userRoleChanged: user, from: old, to: now) }
+            self.delegate?.appEngine(self, audienceChanged: self.audience)
+        }
     }
 
     public func room(_ room: Room, participantDidConnect participant: RemoteParticipant) {
-        let user = userFor(participant)
-        Task { @MainActor in
-            self.delegate?.appEngine(self, userJoined: user)
-            self.delegate?.appEngine(self, audienceChanged: self.audience)
+        let uid = participant.identity?.stringValue ?? ""
+        if pendingLeaves[uid] != nil, let pending = users[uid] {
+            resumeUser(pending, participant)
+        } else {
+            diag.log("user joined uid=\(uid)")
+            let user = userFor(participant)
+            Task { @MainActor in self.delegate?.appEngine(self, userJoined: user) }
         }
+        Task { @MainActor in self.delegate?.appEngine(self, audienceChanged: self.audience) }
     }
 
     public func room(_ room: Room, participantDidDisconnect participant: RemoteParticipant) {
-        guard let user = removeUser(participant) else { return }
-        Task { @MainActor in
-            self.delegate?.appEngine(self, userLeft: user)
-            self.delegate?.appEngine(self, audienceChanged: self.audience)
+        let uid = participant.identity?.stringValue ?? ""
+        if rosterFrozen {
+            // While *we* are reconnecting the transport drops every remote
+            // participant and re-adds them on return. Nobody actually left;
+            // resyncAfterReconnect reports whoever really did.
+            diag.log("user disconnect during our reconnect held: uid=\(uid)")
+            return
         }
+        guard let user = users[uid], user.participant === participant else { return }
+        // The transport does not pass the server's reason for a remote leave;
+        // a clean leave and a drop look the same here, so hold for the grace period.
+        let reason: AppLeaveReason = .unknown
+        let grace = options.remoteLeaveGraceMs
+        if grace > 0, pendingLeaves[uid] == nil {
+            diag.log("user dropped uid=\(uid); holding \(grace / 1000) s")
+            user.state = .reconnecting
+            pendingLeaves[uid] = Task { [weak self] in
+                try? await Task.sleep(nanoseconds: UInt64(grace) * 1_000_000)
+                guard !Task.isCancelled else { return }
+                self?.expireLeave(uid)
+            }
+            Task { @MainActor in self.delegate?.appEngine(self, userStateChanged: user, state: .reconnecting) }
+        } else {
+            pendingLeaves.removeValue(forKey: uid)?.cancel()
+            _ = removeUser(participant)
+            diag.log("user left uid=\(uid) reason=\(reason)")
+            deliverUserLeft(user, reason)
+        }
+        Task { @MainActor in self.delegate?.appEngine(self, audienceChanged: self.audience) }
     }
 
     public func room(_ room: Room, participant: RemoteParticipant, didSubscribeTrack publication: RemoteTrackPublication) {
@@ -1841,22 +2041,39 @@ extension AppEngine: RoomDelegate {
             diag.log("disconnect of the failed direct attempt ignored (retrying through the cloud proxy)")
             return
         }
-        diag.log("connection \(mapped)")
-        if case .reconnecting = state { diag.reconnecting() }
-        if case .disconnected = state {
+        switch state {
+        case .reconnecting:
+            diag.log("reconnecting")
+            diag.reconnecting()
+            rosterFrozen = true
+            setConnectionState(.reconnecting, .networkLost)
+        case .connected where oldState == .reconnecting:
+            diag.log("reconnected")
+            rosterFrozen = false
+            resyncAfterReconnect()
+            setConnectionState(.connected, .networkRestored)
+            let roster = Array(users.values)
+            Task { @MainActor in self.delegate?.appEngine(self, usersResynced: roster) }
+        case .disconnected:
             diag.end("disconnected")
             isJoined = false
             stopStats()
             cancelTokenExpiry()
-            // Report everyone as gone; a stale roster after a disconnect made
-            // remoteUsers wrong until the next join.
-            let gone = Array(users.values)
+            // Our own connection ended; the others are most likely still in the
+            // channel, so nobody is reported as left. The roster is cleared so
+            // remoteUsers is not stale.
+            rosterFrozen = false
+            cancelPendingLeaves()
             users.removeAll()
-            Task { @MainActor in
-                for user in gone { self.delegate?.appEngine(self, userLeft: user) }
-            }
+            var why = Self.connectionReason(of: room.disconnectError)
+            // A clean leave carries no error; a reconnect that gave up carries none either.
+            if why == .unknown { why = connectionState == .reconnecting ? .networkLost : (leaving ? .leaveChannel : .unknown) }
+            setConnectionState(.disconnected, why)
+        default:
+            // .connecting and the first .connected are reported from joinChannel.
+            break
         }
-        Task { @MainActor in self.delegate?.appEngine(self, connectionStateChanged: mapped) }
+        _ = mapped
     }
 
     public func room(_ room: Room, participant: RemoteParticipant?, didReceiveData data: Data, forTopic topic: String, encryptionType: EncryptionType) {
@@ -1961,7 +2178,7 @@ public struct AppGiftEvent: Decodable {
 /// How the video encoder behaved on this phone (POST /v1/sdk/device-report).
 /// Fire-and-forget: every error is swallowed, a call is never affected.
 enum DeviceReports {
-    static let sdkVersion = "0.6.2"
+    static let sdkVersion = "0.7.0"
     static let apiBase = "https://api.applooma.dev/v1"
 
     private static func clean(_ s: String, _ max: Int) -> String {

@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.7.0 — 2026-11-11
+
+- `appEngine(_:userLeft:reason:)` with `AppLeaveReason`, also `user.leaveReason`. The transport does not yet pass the server's reason for a remote leave, so this release reports `.unknown` for an unexplained leave and `.dropped` when the grace period ran out. `appEngine(_:userLeft:)` still fires.
+- **Behaviour change:** when *your own* connection drops, the others are no longer reported through `userLeft`; you get `connectionStateChanged` `.disconnected`.
+- `AppEngineOptions.remoteLeaveGraceMs` (default 20 000) and `appEngine(_:userStateChanged:state:)` (`.reconnecting` / `.active`); back in time → no leave/join pair; not back → `.dropped`. 0 restores the old behaviour.
+- After a reconnect, people who stayed are not announced again; `appEngine(_:usersResynced:)` carries the full roster.
+- `appEngine(_:userRoleChanged:from:to:)` when your server promotes or demotes someone else.
+- `appEngine(_:connectionStateChanged:reason:)` with `AppConnectionReason`, `AppConnectionState.failed`, and `engine.connectionState`.
+
 ## 0.6.3 — 2026-11-11
 
 - No API changes. Built on transport core 3.0.3, whose package targets, public types and generated protocol code no longer carry a third-party engine name.
