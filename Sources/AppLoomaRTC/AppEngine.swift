@@ -607,6 +607,21 @@ public final class AppEngine {
         }
     }
 
+    /// The transport's disconnect reason codes (protocol numbering) → why a remote user left.
+    private static func leaveReason(code: Int?) -> AppLeaveReason {
+        switch code {
+        case 1: return .quit                      // client initiated
+        case 4: return .kicked                    // participant removed
+        case 2: return .duplicateIdentity
+        case 3, 5, 10: return .roomClosed         // server shutdown, room deleted, room closed
+        case 6, 7, 8, 9, 14, 15: return .dropped  // state mismatch, join failure, migration, signal close, timeout, media failure
+        default: return .unknown
+        }
+    }
+
+    /// Whether a leave with this reason may be a drop the user comes back from.
+    private static func holdsForReturn(_ r: AppLeaveReason) -> Bool { r == .dropped || r == .unknown || r == .duplicateIdentity }
+
     private func deliverUserLeft(_ u: AppRemoteUser, _ reason: AppLeaveReason) {
         u.leaveReason = reason
         Task { @MainActor in
@@ -1965,11 +1980,10 @@ extension AppEngine: RoomDelegate {
             return
         }
         guard let user = users[uid], user.participant === participant else { return }
-        // The transport does not pass the server's reason for a remote leave;
-        // a clean leave and a drop look the same here, so hold for the grace period.
-        let reason: AppLeaveReason = .unknown
+        // The server's reason, kept on the participant by the transport core (3.0.4+).
+        let reason = Self.leaveReason(code: participant.lastDisconnectReason?.rawValue)
         let grace = options.remoteLeaveGraceMs
-        if grace > 0, pendingLeaves[uid] == nil {
+        if grace > 0, Self.holdsForReturn(reason), pendingLeaves[uid] == nil {
             diag.log("user dropped uid=\(uid); holding \(grace / 1000) s")
             user.state = .reconnecting
             pendingLeaves[uid] = Task { [weak self] in
@@ -2178,7 +2192,7 @@ public struct AppGiftEvent: Decodable {
 /// How the video encoder behaved on this phone (POST /v1/sdk/device-report).
 /// Fire-and-forget: every error is swallowed, a call is never affected.
 enum DeviceReports {
-    static let sdkVersion = "0.7.0"
+    static let sdkVersion = "0.7.1"
     static let apiBase = "https://api.applooma.dev/v1"
 
     private static func clean(_ s: String, _ max: Int) -> String {
