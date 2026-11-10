@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.6.3 — 2026-11-11
+
+- No API changes. Built on transport core 3.0.3, whose package targets, public types and generated protocol code no longer carry a third-party engine name.
+
 ## 0.6.2 — 2026-11-04
 
 - `joinChannel` throws `AppJoinAbandonedError` when `leaveChannel()` runs before it finishes; no cloud-proxy retry is started. A join that finishes after leave disconnects at once instead of pushing the same user's session out of the room.
