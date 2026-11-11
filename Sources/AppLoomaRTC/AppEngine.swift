@@ -192,13 +192,22 @@ public struct AppAudioOptions: Sendable {
     /// Noise suppression mode, `.standard` by default. `noiseSuppression =
     /// false` also means `.off`. See `AppNoiseSuppression`.
     public var noiseSuppressionMode: AppNoiseSuppression
+    /// What `enableMicrophone(false)` does with the capture. `false` (default):
+    /// the track is muted and the microphone stays open, so unmuting is
+    /// instant. `true`: the microphone track is unpublished and stopped, which
+    /// releases the device: the orange microphone indicator goes off and
+    /// another app can record while you are muted; unmuting republishes (a few
+    /// hundred milliseconds). The same as Agora's `enableLocalAudio(false)`.
+    /// Since 0.7.2.
+    public var releaseMicrophoneOnMute: Bool
 
     public init(echoCancellation: Bool = true, noiseSuppression: Bool = true, autoGainControl: Bool = true,
-                noiseSuppressionMode: AppNoiseSuppression = .standard) {
+                noiseSuppressionMode: AppNoiseSuppression = .standard, releaseMicrophoneOnMute: Bool = false) {
         self.echoCancellation = echoCancellation
         self.noiseSuppression = noiseSuppression
         self.autoGainControl = autoGainControl
         self.noiseSuppressionMode = noiseSuppressionMode
+        self.releaseMicrophoneOnMute = releaseMicrophoneOnMute
     }
 
     /// The mode in force once `noiseSuppression` and `noiseSuppressionMode` are combined.
@@ -1240,7 +1249,18 @@ public final class AppEngine {
     }
 
     public func enableMicrophone(_ on: Bool = true) async throws {
-        try await room.localParticipant.setMicrophone(enabled: on)
+        if on || !options.audio.releaseMicrophoneOnMute {
+            try await room.localParticipant.setMicrophone(enabled: on)
+            return
+        }
+        // Real mute: unpublish and stop the track so the device is released.
+        guard let pub = room.localParticipant.audioTracks.first(where: { $0.source == .microphone }) as? LocalTrackPublication,
+              pub.track != nil else {
+            try await room.localParticipant.setMicrophone(enabled: false)
+            return
+        }
+        try await room.localParticipant.unpublish(publication: pub)
+        diag.log("microphone released (releaseMicrophoneOnMute)")
     }
 
     /// Flip between the front and back cameras. Does nothing until the camera is on.
@@ -2192,7 +2212,7 @@ public struct AppGiftEvent: Decodable {
 /// How the video encoder behaved on this phone (POST /v1/sdk/device-report).
 /// Fire-and-forget: every error is swallowed, a call is never affected.
 enum DeviceReports {
-    static let sdkVersion = "0.7.1"
+    static let sdkVersion = "0.7.2"
     static let apiBase = "https://api.applooma.dev/v1"
 
     private static func clean(_ s: String, _ max: Int) -> String {
@@ -2613,23 +2633,52 @@ enum SmartRoute {
         return host == "applooma.dev" || host.hasSuffix(".applooma.dev")
     }
 
+    /// Per attempt. The API answers in well under a second; a dead region no longer holds it.
+    static let timeout: TimeInterval = 3
+    static let attempts = 2
+
+    /// Everyone in a channel must land on the same media server and the API
+    /// pins the room on the first routed join, so a device that gives up on the
+    /// route and connects to the token's URL can end up alone on another
+    /// server. The route is therefore tried twice and a final failure is logged
+    /// as a warning rather than passed over in silence.
     static func resolve(token: String, wsUrl: String) async -> String {
-        guard isOurs(wsUrl), let url = URL(string: "\(DeviceReports.apiBase)/rtc/route") else { return wsUrl }
-        var req = URLRequest(url: url, timeoutInterval: 2)
+        guard isOurs(wsUrl) else { return wsUrl }
+        for attempt in 0..<attempts {
+            switch await attemptOnce(token: token) {
+            case .routed(let url, let region):
+                #if DEBUG
+                print("[AppLoomaRTC] route region=\(region)\(attempt > 0 ? " (attempt \(attempt + 1))" : "")")
+                #endif
+                return url
+            case .refused:
+                return wsUrl // a clear "no" from the API: retrying cannot change it
+            case .failed:
+                continue
+            }
+        }
+        print("[AppLoomaRTC] warning: smart routing failed after \(attempts) attempts; connecting to the token's server. If others in this channel were routed elsewhere they will not see each other.")
+        return wsUrl
+    }
+
+    private enum Attempt { case routed(String, String), refused, failed }
+
+    private static func attemptOnce(token: String) async -> Attempt {
+        guard let url = URL(string: "\(DeviceReports.apiBase)/rtc/route"),
+              let body = try? JSONSerialization.data(withJSONObject: ["token": token]) else { return .failed }
+        var req = URLRequest(url: url, timeoutInterval: timeout)
         req.httpMethod = "POST"
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.setValue("application/json", forHTTPHeaderField: "Accept")
-        guard let body = try? JSONSerialization.data(withJSONObject: ["token": token]) else { return wsUrl }
         req.httpBody = body
         let (data, response): (Data?, URLResponse?) = await withCheckedContinuation { cont in
             URLSession.shared.dataTask(with: req) { data, response, _ in cont.resume(returning: (data, response)) }.resume()
         }
-        guard let data = data, (response as? HTTPURLResponse)?.statusCode == 200,
+        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+        if (400..<500).contains(status) { return .refused }
+        guard status == 200, let data = data,
               let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
-              let routed = json["wsUrl"] as? String, !routed.isEmpty, isOurs(routed) else { return wsUrl }
-        #if DEBUG
-        if let region = json["region"] as? String { print("[AppLoomaRTC] route region=\(region)") }
-        #endif
-        return routed
+              let routed = json["wsUrl"] as? String, !routed.isEmpty, isOurs(routed) else { return .failed }
+        return .routed(routed, json["region"] as? String ?? "")
     }
 }
